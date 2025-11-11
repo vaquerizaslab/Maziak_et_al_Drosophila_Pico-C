@@ -1,0 +1,24 @@
+metafile:
+  "PRJNA640381.txt"
+
+fastp: 
+  window_size: 1
+  mean_quality: 20
+
+quality:
+  unique: 10
+  multi: 0
+
+
+index:
+  "/home/research/vaquerizas/store/genomes/insects/Dmel/ucsc/Bowtie2Index/genome"
+
+
+blacklist:
+  "dm6-blacklist.v2.bed"
+
+
+
+genomesize: # Default for dm6 and 100 bp
+  unique: 129789873 
+  multi: 142573017

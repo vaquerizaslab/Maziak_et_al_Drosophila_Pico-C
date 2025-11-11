@@ -1,0 +1,116 @@
+---
+title: "Loops upset plot"
+output: html_document
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(hicVennDiagram)
+library(ggplot2)
+library(GenomicInteractions)
+library(ComplexUpset)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(extrafont)
+library(showtext)
+
+#Knit options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+#Import files, and use a maxgap sized 5 kb
+```{r}
+all_files <- Sys.glob("0.01/NC*/NC*_250_1kb_2kb_4kb_16kb.clean.bed")
+interactions <- lapply(all_files, makeGenomicInteractionsFromFile, type="bedpe") %>% 
+  magrittr::set_names(str_extract(all_files, "0.01/(NC.+)/NC", group = 1))
+
+
+venn <- vennCount(interactions, maxgap = 5000, FUN = max)
+
+upset_themes_fix <- lapply(ComplexUpset::upset_themes, function(.ele){
+    lapply(.ele, function(.e){
+        do.call(theme, .e[names(.e) %in% names(formals(theme))])
+    })
+})
+
+#venn@vennCounts[, colnames(venn@vennCounts)]
+#venn@vennCounts
+
+combinations <- venn$combinations
+expInput <- venn$counts
+
+plotdata <- combinations[rep(rownames(combinations), expInput), ]
+
+plotdata <- as.data.frame(plotdata) %>% 
+  relocate(NC9)
+```
+
+#Now let's plot upset:
+```{r}
+
+p <- upset(
+  data=plotdata,
+  intersect=colnames(plotdata),
+  min_size = 80, #For visualization
+  sort_sets = FALSE,
+  set_sizes = (upset_set_size() + 
+                 theme(axis.text.x=element_text(size = 8), ## edit set size panel 
+                        axis.title = element_text(size = 16),
+                                        panel.grid.minor = element_blank())
+                + ylab('Loop count')),
+  queries = list(
+    #upset_query(set="NC9",fill="#3C5488"),
+    upset_query(set="NC10",fill="#E64B35"),
+    upset_query(set = "NC11", fill = "#4DBBD5"),
+    upset_query(set = "NC12", fill = "#00A087"),
+    upset_query(set = "NC13", fill = "#B09C85"),
+    upset_query(set = "NC14", fill = "#F9D271")
+  ),
+  height_ratio=1,
+  width_ratio=0.2, #0.2
+  base_annotations=list(
+        'Loop\nintersects'=intersection_size(counts=TRUE) + 
+         theme_classic() +## edit intersect size panel 
+         theme(axis.text = element_text(size = 12),
+               axis.title = element_text(size = 16),
+               axis.text.x=element_blank(),
+                axis.ticks.x=element_blank(),
+               panel.grid.minor = element_blank()
+          )
+  )
+) + theme(  ## edit dot plot panel 
+    axis.text = element_text(size = 20),  
+    axis.title = element_text(size = 16),  
+    legend.text = element_text(size = 16), 
+    legend.title = element_text(size = 18)
+    ) + xlab("Grouping")
+
+p
+
+```
+
+
+```{r}
+#To export subsets, you can run the following:
+
+#NC12_only <- venn$overlapList[["001000"]] #276 loops used in Supplemental panel for NC12 specific loop aggregate
+#NC11_NC12_NC13 <- venn$overlapList[["011100"]]
+#NC12_NC13 <- venn$overlapList[["001100"]]
+#NC11_NC12 <- venn$overlapList[["011000"]]
+#NC14_only <- venn$overlapList[["000010"]]
+
+#export.bedpe(NC12_only$NC12, fn = "subset/NC12_only_loops.bedpe")
+#export.bedpe(NC11_NC12_NC13$NC12, fn = "subset/NC11_NC12_NC13_loops.bedpe")
+#export.bedpe(NC12_NC13$NC12, fn = "subset/NC12_NC13_loops.bedpe")
+#export.bedpe(NC11_NC12$NC12, fn = "subset/NC11_NC12_loops.bedpe")
+#export.bedpe(NC14_only$NC14, fn = "subset/NC14_loops.bedpe")
+```
+
+```{r}
+sessioninfo::session_info()
+```

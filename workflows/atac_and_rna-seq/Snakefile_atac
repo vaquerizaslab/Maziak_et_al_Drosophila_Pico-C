@@ -1,0 +1,397 @@
+from collections import defaultdict
+from pathlib import Path
+import pandas as pd
+import re
+
+#-------------------#
+# Setup
+#-------------------#
+configfile: 'config_atac.yaml'
+Path('logs').mkdir(parents=True, exist_ok=True)
+
+
+rule all:
+    input:
+        expand("data/coverage/{id}_open.bw", id=["Jabba","CT"]),
+        expand("data/qc/pca/PCA_plot_{bS}.tab", bS=["500"]),
+        directory("results/homer/ct_lost")
+
+
+#-------------------#
+# Trimming
+#-------------------#
+
+rule fastp:
+    """Trim adapters and remove low-quality reads/basecalls."""
+    input:
+        "fastq/{id}_{rep}_R1.fastq.gz",
+        "fastq/{id}_{rep}_R2.fastq.gz"
+    output:
+        "data/trimmed/{id}_{rep}_R1.fastq.gz",
+        "data/trimmed/{id}_{rep}_R2.fastq.gz"
+    resources:
+        time= "03:00:00",
+        mem= "50G"
+    params:
+        size = config['fastp']['window_size'],
+        quality = config['fastp']['mean_quality'],
+        report_base = "data/fastp/{id}_{rep}/fastp"
+    threads: 4
+    script:
+        "scripts/fastp.py"
+
+
+#-------------------#
+# Aligning
+#-------------------#
+
+rule bowtie2:
+    """Align reads to a reference genome with bowtie2."""
+    input:
+        rules.fastp.output
+    output:
+        temp("data/alignment/{id}_{rep}.sam")
+    resources:
+        time= "10:00:00",
+        mem= "40G"
+    params:
+        index = "genomes/bowtie2dm6/dm6"
+    threads: 10
+    shell:
+        "bowtie2 --threads {threads} "
+        "-1 {input[0]} -2 {input[1]} "
+        "-x {params.index} "
+        "-S {output} "
+        "--maxins 2000 -N 1 --no-unal --no-mixed --no-discordant"
+
+
+#-------------------#
+# SAM to BAM to Final BAM
+#-------------------#
+
+rule sambamba_view:
+    """Turn SAM files into BAM using sambamba view."""
+    input:
+        rules.bowtie2.output
+    output:
+        temp("data/alignment/{id}_{rep}.bam")
+    threads: 4
+    resources:
+        time= "02:00:00",
+        mem= "10G"
+    shell:
+        "sambamba view -t {threads} "
+        "-S -f bam "
+        "-F \"mapping_quality >= 10\" "
+        "-o {output} "
+        "{input}"
+
+
+rule sambamba_sort:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.sambamba_view.output
+    output:
+        bam = "data/alignment/{id}_{rep}_sorted.bam"
+    resources:
+        time= "02:00:00",
+        mem= "10G"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input}"
+
+
+rule sambamba_markdup:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.sambamba_sort.output
+    output:
+        bam = "data/alignment/{id}_{rep}_noDup.sorted.bam",
+        bai = "data/alignment/{id}_{rep}_noDup.sorted.bam.bai"
+    resources:
+        time= "02:00:00",
+        mem= "10G"
+    threads: 4
+    shell:
+        "sambamba markdup --remove-duplicates "
+        "{input} {output.bam} "
+        "&& "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}"
+
+
+#-------------------#
+# Merge
+#-------------------#
+
+
+rule merge_and_sort:
+    input:
+        bams = expand("data/alignment/{{id}}_{rep}_noDup.sorted.bam", 
+                      rep=["rep1", "rep2", "rep3", "rep4"])
+    output:
+        "data/alignment/merge_reps/{id}.bam"
+    resources:
+        time = "08:15:00",
+        mem = "30G"
+    threads: 4
+    shell:
+        """
+        sambamba merge -t {threads} {wildcards.id}_temp.bam {input.bams}
+        sambamba sort -t {threads} -o {output} {wildcards.id}_temp.bam
+        rm -f {wildcards.id}_temp.bam
+        """
+
+
+rule index: 
+    input:
+        "data/alignment/merge_reps/{id}.bam"
+    output:
+        "data/alignment/merge_reps/{id}.bam.bai"
+    resources:
+        time= "08:15:00",
+        mem= "5G"
+    threads: 4
+    shell:
+        "sambamba index -t {threads} "
+        "{input} {output}"
+
+
+rule deeptools_alignmentsieve_open:
+    """Shift ATAC-seq reads by 9bp to correct for Tn5 cutting with deeptools."""
+    input:
+        bam = "data/alignment/merge_reps/{id}.bam",
+        bai = "data/alignment/merge_reps/{id}.bam.bai"
+    output:
+        temp("data/alignment/merge_reps_open/{id}_open.bam")
+    threads: 4
+    resources:
+        time= "03:00:00",
+        mem= "10G"
+    shell:
+        "deeptools --version && "
+        "alignmentSieve -p {threads} "
+        "--ATACshift --blackListFileName dm6-blacklist.v2.bed "
+        "--maxFragmentLength 100 "
+        "--bam {input.bam} --outFile {output}"
+
+
+rule deeptools_alignmentsieve_mono:
+    """Shift ATAC-seq reads by 9bp to correct for Tn5 cutting with deeptools."""
+    input:
+        bam = "data/alignment/merge_reps/{id}.bam"
+    output:
+        temp("data/alignment/merge_reps_mono/{id}_mono.bam")
+    threads: 4
+    resources:
+        time= "03:00:00",
+        mem= "10G"
+    shell:
+        "deeptools --version && "
+        "alignmentSieve -p {threads} "
+        "--ATACshift --blackListFileName dm6-blacklist.v2.bed "
+        "--minFragmentLength 180 "
+        "--maxFragmentLength 250 "
+        "--bam {input.bam} --outFile {output}"
+
+
+rule sambamba_sort_open:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.deeptools_alignmentsieve_open.output
+    output:
+        bam = "data/merge_reps_open/{id}_open.sorted.bam",
+        bai = "data/merge_reps_open/{id}_open.sorted.bam.bai"
+    resources:
+        time= "08:15:00",
+        mem= "10G"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input} && "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}" 
+
+rule sambamba_sort_mono:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.deeptools_alignmentsieve_mono.output
+    output:
+        bam = "data/merge_reps_mono/{id}_mono.sorted.bam",
+        bai = "data/merge_reps_mono/{id}_mono.sorted.bam.bai"
+    resources:
+        time= "08:15:00",
+        mem= "10G"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input} && "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}"
+
+
+rule bamCoverage:
+    """Create bigWig coverage tracks from BAM files with bamCoverage."""
+    input:
+        bam = "data/merge_reps_{type}/{id}_{type}.sorted.bam",
+        bai = "data/merge_reps_{type}/{id}_{type}.sorted.bam.bai"
+    output:
+        "data/coverage/{id}_{type}.bw"
+    threads: 4
+    resources:
+        time= "4:00:00",
+        mem= "20G"
+    shell:
+        "deeptools --version && "
+        "bamCoverage -b {input.bam} "
+        "-o {output} -p {threads} "
+        "--normalizeUsing RPGC "
+        "--minMappingQuality 3 "
+        "--blackListFileName dm6-blacklist.v2.bed "
+        "--effectiveGenomeSize 142573017 "
+        "--binSize 5"
+
+#-------------------#
+# QC
+#-------------------#
+
+rule raw_fastqc:
+    """Control quality of raw reads using FASTQC."""
+    input:
+        "fastq/{id}_{rep}_{read}.fastq.gz"
+    output:
+        "data/fastqc/untrimmed/{id}_{rep}_{read}_fastqc.zip"
+    threads: 4
+    shell:
+        "fastqc -j /home/linuxbrew/.linuxbrew/Cellar/openjdk/19/bin/java "
+        "-t {threads} -o data/fastqc/untrimmed {input}"
+
+rule samtools_flagstat:
+    """Get alignment statistics with samtools flagstat."""
+    input:
+        expand("data/alignment/{id}_{rep}_noDup.sorted.bam",
+                id = ["Jabba", "CT"],
+                rep = ["rep1", "rep2", "rep3","rep4"]
+        )
+    output:
+        "data/stats/{id}.flgst"
+    threads: 2
+    shell:
+        "samtools --version && "
+        "samtools flagstat -@ {threads} "
+        "{input} > {output}"
+
+
+rule multiBamSummary:
+    """Compute read coverages for genomic bins with multiBamSummary."""
+    input:
+        expand("data/alignment/{id}_{rep}_noDup.sorted.bam",
+                id = ["Jabba", "CT"],
+                rep = ["rep1", "rep2", "rep3","rep4"]
+        )
+    output:
+        "data/qc/pca/multibamsummary_{bS}.npz"
+    threads: 8
+    resources:
+        time= "03:00:00",
+        mem= "10G"
+    shell:
+        "multiBamSummary bins "
+        "-p {threads} "
+        "--bamfiles "
+        "{input} "
+        "--blackListFileName dm6-blacklist.v2.bed "
+        "--binSize {wildcards.bS} "
+        "-o {output}"
+
+rule plotPCA:
+    """Creates PCA plot for BAM files with plotPCA."""
+    input:
+        rules.multiBamSummary.output
+    output:
+        pdf = "data/qc/pca/PCA_plot_{bS}.pdf",
+        tsv = "data/qc/pca/PCA_plot_{bS}.tab"
+    threads: 1
+    resources:
+        time= "03:00:00",
+        mem= "10G"
+    shell:
+        "plotPCA -in {input} " 
+        "-o {output.pdf} "
+        "--transpose "
+        "--outFileNameData {output.tsv} "
+
+#-------------------#
+# HMMRATAC
+#-------------------#
+
+
+rule HMMRATAC: 
+    input:
+        bam = "data/alignment/merge_reps/{id}.bam",
+        bai = "data/alignment/merge_reps/{id}.bam.bai",
+        genome = "genome/dm6.genome"
+    output:
+        "HMMRATAC/{id}/{id}_peaks.gappedPeak"
+    resources:
+        time= "03:00:00",
+        mem= "20G"
+    shell: 
+        "java -Xmx20G -jar HMMRATAC_V1.2.10_exe.jar "
+        "-b {input.bam} "
+        "-i {input.bai} "
+        "-g {input.genome} "
+        "--blacklist dm6-blacklist.v2.bed "
+        "--bedgraph True "
+        "-o {wildcards.id}"
+
+
+#-------------------#
+### process_peaks ###
+#-------------------# 
+
+
+rule prep_gappedPeaks: 
+    input: 
+        "HMMRATAC/{id}/{id}_peaks.gappedPeak"
+    output:
+        "HMMRATAC/intermediates/{id}_open.gappedPeak"
+    shell:
+        "awk '($4 != \"HighCoveragePeak_0\")' {input} | "
+        "awk 'BEGIN {{OFS=\"\t\"}}; {{print $1, $7, $8, $4}}' | "
+        "awk 'BEGIN{{ FS = OFS = \"\t\" }} {{ print $0, \"{wildcards.id}\" }}' "
+        "> {output}"
+
+
+#----------------#
+### HOMER ###
+#----------------#
+
+rule subset_open_lost: 
+    input: 
+        ct = "HMMRATAC/intermediates/CT_open.gappedPeak",
+        jabba = "HMMRATAC/intermediates/Jabba_open.gappedPeak"
+    output:
+        "HMMRATAC/specific/CT_specific_open.gappedPeak"
+    shell: 
+        "bedtools subtract "
+        "-a {input.ct} "
+        "-b {input.jabba} "
+        "> {output}"
+
+rule homer:
+    input:
+        "HMMRATAC/specific/CT_specific_open.gappedPeak"
+    output:
+        directory("results/homer/ct_lost")
+    resources:
+        time= "04:00:00", 
+        mem= "10G"
+    shell:
+        "findMotifsGenome.pl {input} "
+        "dm6.fa "
+        "{output} -size given" 

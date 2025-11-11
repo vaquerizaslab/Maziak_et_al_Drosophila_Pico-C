@@ -1,0 +1,188 @@
+"""Analysing RNA-seq data (SE)"""
+
+from pathlib import Path
+import pandas as pd
+import re
+
+
+#-------------------#
+# Setup
+#-------------------#
+
+configfile: 'config.yaml'
+Path('logs').mkdir(parents=True, exist_ok=True)
+
+# Load meta-file
+metadata = pd.read_csv(config['metafile'], sep='\t')
+if 'run_accession' in metadata.columns:
+    run_ids = metadata['run_accession']
+    samples = metadata['sample_title']
+    sample2id = dict(zip(samples, run_ids))
+else:
+    run_ids = metadata['id']
+    samples = metadata['sample']
+    id2sample = dict(zip(run_ids, samples))
+
+#localrules: multiqc
+
+wildcard_constraints: id = '|'.join(run_ids.tolist())
+
+rule all:
+    input:
+        expand("fastq/{id}.fastq.gz", id = run_ids), 
+        expand("star/{id}_Aligned.sortedByCoord.out.bam.bai", id = run_ids),
+        expand("data/coverage/{sample}_{mappability}.bw", 
+                sample=samples,
+                mappability=config['quality'].keys()),
+        "results/stats/correlation_plot.png",
+        "results/stats/PCA_plot.png",
+        "data/coverage/Eluate_cellblast_merge.bw",
+        "data/coverage/Eluate_synblast_merge.bw"
+
+
+#-------------------#
+# Dowloading files
+#-------------------#
+
+if 'run_accession' in metadata.columns:
+    rule download:
+        """Download FASTQ files from ENA using wget and check md5 sums."""
+        output:
+            "fastq/{id}.fastq.gz"
+        threads: 1
+        script:
+            "scripts/download.py"
+
+
+#-------------------#
+# Trimming
+#-------------------#
+
+rule fastp:
+    input:
+        "fastq/{sample}.fastq.gz"
+    output:
+        R="fastq/trimmed/trimmed_{sample}.fastq",
+        html="fastq/fastp/{sample}.fastp.html"
+    threads: 30
+    shell:
+        "fastp -i {input} -o {output.R} "
+        "--thread {threads} --overrepresentation_analysis --html {output.html}"
+
+
+#-------------------#
+# Aligning
+#-------------------#
+
+rule align:
+    input:
+        "fastq/trimmed/trimmed_{id}.fastq"
+    output:
+        "star/{id}_Aligned.sortedByCoord.out.bam"
+    threads: 8
+    shell:
+        "STAR --genomeDir Star_dm6/ "
+        "--runThreadN {threads} "
+        "--readFilesIn {input} "
+        "--outFileNamePrefix star/{wildcards.id}_ "
+        "--outFilterMismatchNoverLmax 0.04 "
+        "--outSAMtype BAM SortedByCoordinate "
+        "--outFilterMultimapNmax 1 "
+        "--outMultimapperOrder Random "
+        "--outSAMmultNmax 1 "
+        "--outSAMunmapped Within "
+        "--outSAMattributes Standard" 
+
+
+rule sambamba_index:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.align.output
+    output:
+        bai = "star/{id}_Aligned.sortedByCoord.out.bam.bai"
+    threads: 4
+    shell:
+        "sambamba index -t {threads} "
+        "{input} {output.bai}"
+
+
+#-------------------#
+# Coverage tracks
+#-------------------#
+
+
+rule bamCoverage:
+    """Create bigWig coverage tracks from BAM files with bamCoverage."""
+    input:
+        lambda wc: expand(rules.align.output, id= sample2id[wc.sample])
+    output:
+        "data/coverage/{sample}_{mappability}.bw"
+    params:
+        blacklist = config['blacklist'],
+        genomesize = lambda wc: config['genomesize'][wc.mappability],
+        quality = lambda wc: config['quality'][wc.mappability]
+    threads: 4
+    shell:
+        "bamCoverage --version && "
+        "bamCoverage -p {threads} "
+        "--binSize 1 --extendReads 1 --minMappingQuality {params.quality} "
+        "--normalizeUsing RPGC --effectiveGenomeSize {params.genomesize} "
+        "--ignoreForNormalization X --blackListFileName {params.blacklist} "
+        "--bam {input} -of bigwig --outFileName {output}"
+
+#-------------------#
+# QC
+#-------------------#
+
+rule multiBamSummary:
+    """Compute read coverages for genomic bins with multiBamSummary."""
+    input:
+        expand(
+            rules.align.output,
+            id=run_ids
+        )
+    output:
+        summary = "data/stats/multiBamSummary.npz",
+        factors = "data/stats/scaling_factors.tsv"
+    threads: 8
+    params:
+        labels = samples.to_list(),
+        blacklist = config['blacklist'],
+        quality = config['quality']['unique']
+    shell:
+        "multiBamSummary --version && "
+        "multiBamSummary bins -p {threads} "
+        "--labels {params.labels} --extendReads 25 "
+        "--minMappingQuality {params.quality} "
+        "--scalingFactors {output.factors} "
+        "--blackListFileName {params.blacklist} "
+        "--bamfiles {input} -o {output.summary}"
+
+rule plotPCA:
+    """Creates PCA plot for BAM files with plotPCA."""
+    input:
+        rules.multiBamSummary.output.summary
+    output:
+        png = "results/stats/PCA_plot.png",
+        tab = "results/stats/PCA_plot.tab"
+    threads: 1
+    shell:
+        "plotPCA --version && "
+        "plotPCA -in {input} -o {output.png} "
+        "--outFileNameData {output.tab}"
+
+rule plotCorrelation:
+    """Creates correlation plots for BAM files with plotCorrelation."""
+    input:
+        rules.multiBamSummary.output.summary
+    output:
+        "results/stats/correlation_plot.png"
+    threads: 1
+    shell:
+        "plotCorrelation --version && "
+        "plotCorrelation "
+        "--corMethod pearson -p scatterplot "
+        "--skipZeros --removeOutliers --log1p "
+        "-in {input} -o {output}"
+
+

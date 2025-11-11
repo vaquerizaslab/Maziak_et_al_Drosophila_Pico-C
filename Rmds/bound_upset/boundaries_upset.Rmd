@@ -1,0 +1,109 @@
+---
+title: "Boundaries upset plot"
+output: html_document
+
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(GenomicInteractions)
+library(GenomicRanges)
+library(ComplexUpset)
+library(ComplexHeatmap)
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(extrafont)
+library(showtext)
+
+#Knit options
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+
+
+# Let's import beds
+```{r}
+file_list = c(
+    "NC14" = "beds/NC14_0.45_16kb_500bp_boundaries.nocento.bed",
+    "NC13" = "beds/NC13_0.45_16kb_500bp_boundaries.nocento.bed",
+    "NC12" = "beds/NC12_0.45_16kb_500bp_boundaries.nocento.bed",
+    "NC11" = "beds/NC11_0.45_16kb_500bp_boundaries.nocento.bed",
+    "NC10" = "beds/NC10_0.45_16kb_500bp_boundaries.nocento.bed",
+    "NC9" = "beds/NC9_0.45_16kb_500bp_boundaries.nocento.bed"
+)
+
+boundary_list = lapply(file_list, function(f) {
+    df = read.table(f)
+    GRanges(seqnames = df[, 1], ranges = IRanges(df[, 2], df [, 3]))
+}) %>% 
+  as("GRangesList")
+
+p <- unlist(boundary_list) %>% 
+  resize(width = width(.) + (2500*2), fix = "center") %>% 
+  GenomicRanges::reduce()
+
+
+data <- data.frame(
+  NC9 = overlapsAny(p, boundary_list[["NC9"]]),
+  NC10 = overlapsAny(p, boundary_list[["NC10"]]),
+  NC11 = overlapsAny(p, boundary_list[["NC11"]]),
+  NC12 = overlapsAny(p, boundary_list[["NC12"]]),
+  NC13 = overlapsAny(p, boundary_list[["NC13"]]),
+  NC14 = overlapsAny(p, boundary_list[["NC14"]])
+)
+```
+
+# Now let's plot:
+```{r}
+upset(
+  data=data,
+  intersect=colnames(data),
+  min_size = 30,
+  sort_sets = FALSE,
+  set_sizes = (upset_set_size() + 
+                 theme(axis.text.x=element_text(size = 10, family = "roboto"), ## edit set size panel 
+                        axis.title = element_text(size = 14, family = "roboto"),
+                                        panel.grid.minor = element_blank()) +
+                  ylab('Boundary count') +
+                 scale_y_reverse( 
+                     breaks = c(3000, 1500, 1))
+                 ),
+  queries = list(
+    upset_query(set="NC9",fill="#3C5488"),
+    upset_query(set="NC10",fill="#E64B35"),
+    upset_query(set = "NC11", fill = "#4DBBD5"),
+    upset_query(set = "NC12", fill = "#00A087"),
+    upset_query(set = "NC13", fill = "#B09C85"),
+    upset_query(set = "NC14", fill = "#F9D271")
+  ),
+  height_ratio=1,
+  width_ratio=0.2, #0.2
+  base_annotations=list(
+        'Boundary\nintersects'=intersection_size(counts=TRUE) + 
+         theme_classic() +## edit intersect size panel 
+         theme(axis.text = element_text(size = 10, family = "roboto"),
+               axis.title = element_text(size = 14, family = "roboto"),
+               axis.text.x=element_blank(),
+                axis.ticks.x=element_blank(),
+               panel.grid.minor = element_blank()
+          )
+  )
+) + theme(  ## edit dot plot panel 
+    axis.text = element_text(size = 18, family = "roboto"),  
+    axis.title = element_text(size = 14, family = "roboto"),  
+    legend.text = element_text(size = 14, family = "roboto"), 
+    legend.title = element_text(size = 16, family = "roboto")
+    ) + xlab("Grouping")
+
+```
+
+
+```{r}
+sessioninfo::session_info()
+```
+

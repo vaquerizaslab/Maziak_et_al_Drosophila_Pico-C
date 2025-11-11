@@ -1,0 +1,62 @@
+#
+#Downstream: Removing blacklisted region
+#
+
+from pathlib import Path
+import pandas as pd
+import re
+
+
+#-------------------#
+# Setup
+#-------------------#
+
+configfile: 'config.yaml'
+Path('logs').mkdir(parents=True, exist_ok=True)
+
+# Load meta-file
+metadata = pd.read_csv(config['metafile'], sep='\t')
+if 'run_accession' in metadata.columns:
+    run_ids = metadata['run_accession']
+    samples = metadata['sample_title']
+    sample2id = dict(zip(samples, run_ids))
+else:
+    run_ids = metadata['id']
+    samples = metadata['sample']
+    id2sample = dict(zip(run_ids, samples))
+
+
+wildcard_constraints: id = '|'.join(run_ids.tolist())
+
+
+rule all:
+    input:
+        expand("final_bam/{id}_final.bam", id=run_ids)
+
+
+rule remove_blacklist:
+    input:
+        "bams/{id}_Aligned.sortedByCoord.out.bam"
+    output:
+        "bams/{id}_nobl.bam"
+    params:
+        blacklist = config['blacklist']
+    shell:
+        "bedtools intersect -v -abam {input} -b {params.blacklist} > {output}"
+
+
+rule sambamba_sort:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.remove_blacklist.output
+    output:
+        bam = "final_bam/{id}_final.bam",
+        bai = "final_bam/{id}_final.bam.bai"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input} "
+        "&& "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}"

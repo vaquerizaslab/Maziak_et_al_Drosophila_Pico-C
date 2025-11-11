@@ -1,0 +1,4 @@
+sample_id	location	read1	read2	sample_name	genome	fragments	stage
+N55		N55_1.fastq.gz	N55_2.fastq.gz	N55	dm	100	NC14
+N57		N57_1.fastq.gz	N57_2.fastq.gz	N57	dm	100	NC14
+

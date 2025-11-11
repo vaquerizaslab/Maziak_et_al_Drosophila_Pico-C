@@ -1,0 +1,117 @@
+from collections import defaultdict
+from pathlib import Path
+import pandas as pd
+import re
+
+
+#-------------------#
+# Setup
+#-------------------#
+chromosomes = {'dm': ["chr2L", "chr2R", "chr3L", "chr3R", "chr4", "chrX", "chrY"]}
+configfile: 'config.yaml'
+
+metadata = pd.read_csv(config["samples"], sep = '\t')
+stages = ["NC14"]
+IDs = metadata.set_index("sample_name", drop=False)
+stage2sample  = defaultdict(list)
+for row in metadata.itertuples():
+    stage2sample[row.stage].append(row.sample_id)
+
+test_res = ["1kb"] #example
+
+chrom = ["chr2L", "chr2R", "chr3L", "chr3R", "chrX"]
+#-------------------#
+
+localrules: all
+
+
+rule all:
+    input:
+        ## pairtools.smk ##
+        expand("pairtools/qc/pairtools_stats/{id}.stats",
+            id = IDs.sample_id),
+        ## pt2fanc.smk ##
+        expand( "fanc/hic/{id}_{res}.hic",
+            id= IDs.sample_id,
+            res = test_res),
+        expand("{stage}/hic_ice/{stage}_{res}.hic",
+            stage = stages,
+            res = test_res),
+        ## qc.smk ##
+        expand("qc/region_plots/{stage}_{res}.png",
+            stage = stages,
+            res = test_res),
+        expand("{stage}/hic_ice/{stage}.resolution.pdf",
+            stage = stages),
+        expand("fanc/pca/fanc_pca_{res}_nodiag_ice_s100k.pca",
+            res = ["100kb"]),
+        ## make_mcool.smk ##
+        expand("mcool/{stage}_{res}.mcool",
+            stage = stages,
+            res = test_res),
+        ## extract_lowmap.smk ##
+        expand("outputs/marginals/final/dm6_marginals_2kb.bed"),
+        #-----------------------#
+        ## distance_decay.smk ##
+        expand("outputs/distance_decay/{stage}/{stage}_{res}_expected_values_per_chrom.txt",
+            stage = stages,
+            res = test_res),
+        ## loop_calling.smk ##
+        expand("mustache/final/clodius/{cutoff}/clean/{stage}_250_1kb_2kb_4kb_16kb.clean.multires",
+            cutoff = ["0.01"],
+            stage = stages),
+        ## boundaries.smk ##
+        expand("outputs/boundaries/downsampled/insulation_boundaries/{stage}_500bp.insulation_12kb.bigwig",
+            stage = stages),
+        expand("outputs/boundaries/final/{stage}_0.45_16kb_500bp_boundaries.nocento.bed",
+            stage = stages),
+        ## compartments.smk ##
+        expand("outputs/compartments_CALDER/ICE/{stage}_{bin}/sub_compartments/all_sub_compartments_{bin}_sub_{comp}.bed",
+            stage = stages, 
+            bin = ["3kb"],
+            comp = ["A1", "A2", "B1", "B2"]),
+        expand("outputs/compartments_CALDER/ICE/{stage}_{bin}/sub_compartments/all_sub_compartments_{bin}_ab_{comp}.bed",
+            stage = stages, 
+            bin = ["3kb"],
+            comp = ["A", "B"]),
+        ## coolpup_aggregates.smk ##
+        expand("outputs/coolpup/boundaries/plots/{stage}_{res}_boundaries_{flank}.all.pdf",
+            stage = stages, 
+            res = ["250"],
+            flank = ["20000"]),
+        expand("outputs/coolpup/loops/plots/{stage}_{res}_loops_{flank}.bydist.pdf",
+            stage = stages,
+            res = ["1000"],
+            flank = ["50000"]),
+        expand("outputs/coolpup/compartments/plots/comp_{stage}/{stage}_comp{comp}_r{res}.pdf",
+            stage = stages,
+            comp = ["A", "A1", "A2","B", "B1", "B2"],
+            res = ["2000"])
+
+
+#-------------------#
+#-------------------#
+
+## For main pico-c processing ##
+include: "rules/pairtools.smk"
+include: "rules/pt2fanc.smk"
+include: "rules/qc.smk"
+include: "rules/make_mcool.smk"
+
+### Extract regions of low mappability & downsample .hic files##
+include: "rules/extract_lowmap.smk"
+
+## For Distance decay ##
+include: "rules/distance_decay.smk"
+
+## For Loop-Calling ##
+include: "rules/loop_calling.smk"
+
+## For Boundary Calls ##
+include: "rules/boundaries.smk"
+
+## For Compartment Calls ##
+include: "rules/compartments.smk"
+
+## For Aggregate Plots ##
+include: "rules/coolpup_aggregates.smk"

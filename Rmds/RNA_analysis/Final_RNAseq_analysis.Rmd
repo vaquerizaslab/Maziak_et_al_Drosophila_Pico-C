@@ -1,0 +1,446 @@
+---
+title: "RNAseq"
+output:
+  html_document:
+    code_folding: show
+---
+
+```{r message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(RColorBrewer)
+library(ggrepel)
+library(ggplot2)
+library(patchwork)
+library(DESeq2)
+library(reshape2)
+library(dplyr)
+```
+
+
+```{r}
+# Define color palette
+class_colors <- c(
+  mat = "#1C032B99",
+  zyg = "#E29454",
+  matzyg = "#C54836",
+  unclassified = "#DCDCDC"
+)
+
+colors <- brewer.pal(2, "Set1")
+
+# Load annotation data-set from Lott et al. 
+annots <- read_tsv("genes-mat-zyg/Dataset_S1.txt")
+# Keep only NAME and CLASS
+annots <- annots %>%
+  dplyr::select(NAME, CLASS) %>%
+  distinct()
+# Clean up class labels (optional)
+annots$CLASS[annots$CLASS == ""] <- "unclassified"
+annots$CLASS <- factor(annots$CLASS, levels = c("mat", "zyg", "matzyg", "unclassified"))
+```
+
+
+```{r}
+# List all files with gene and ERCC counts
+gene_files <- list.files("featureCounts", pattern = "Genes_featureCounts_.*\\.txt$", full.names = TRUE)
+ercc_files <- list.files("featureCounts", pattern = "ERCC_featureCounts_.*\\.txt$", full.names = TRUE)
+
+# Helper to extract sample name from filename
+get_sample_name <- function(f) {
+  gsub("(Genes|ERCC)_featureCounts_(control|amanitin)_rep(\\d)\\.txt", "\\2\\3", basename(f)) %>%
+    gsub("control", "Ctl", .) %>%
+    gsub("amanitin", "Trt", .)
+}
+
+# Read and combine gene + ERCC counts for each sample
+sample_dfs <- map2(gene_files, ercc_files, function(gene_file, ercc_file) {
+  # Read gene and ERCC count files
+  gene_df <- read_tsv(gene_file, comment = "#")
+  ercc_df <- read_tsv(ercc_file, comment = "#")
+
+  # Select only Geneid and count (last column)
+  gene_df <- gene_df %>%
+    dplyr::select(Geneid, count = ncol(.))
+  ercc_df <- ercc_df %>%
+    dplyr::select(Geneid, count = ncol(.))
+
+  # Combine counts
+  full_df <- bind_rows(gene_df, ercc_df)
+
+  # Create sample name
+  sample_name <- get_sample_name(gene_file)
+  colnames(full_df)[2] <- sample_name
+
+  return(full_df)
+})
+
+
+# Merge all samples by Geneid
+counts <- purrr::reduce(sample_dfs, full_join, by = "Geneid")
+counts <- column_to_rownames(counts, "Geneid")
+
+# Filter for highly-expressed genes (1000+ counts) to find unchanged control genes
+filter <- apply(counts, 1, function(x) length(x[x>1000])>=2)
+counts_filtered <- counts[filter,]
+
+# Get the names of all ERCC spike-ins and genes
+spikes <- rownames(counts_filtered)[grep("^ERCC", rownames(counts_filtered))]
+genes  <- setdiff(rownames(counts_filtered), spikes)
+
+head(counts_filtered)
+counts_filtered[rownames(counts_filtered) == "lncRNA:CR44504", ]
+```
+
+
+Create uncorrected dds for DESeq2
+```{r}
+# Prepare objects for creating DESeqDataSet
+matrix.cts <- as.matrix(counts_filtered)
+
+coldata <- data.frame(
+  condition = factor(c("amanitin", "amanitin", "amanitin", 
+                       "water", "water", "water")) %>% relevel(ref = "water")
+)
+
+rownames(coldata) <- colnames(matrix.cts)
+coldata
+
+# Run DESeq2
+dds <- DESeqDataSetFromMatrix(countData = matrix.cts,
+                              colData = coldata,
+                              design = ~ condition)
+
+dds <- DESeq(dds)
+res <- results(dds)
+
+
+# Plot results (uncorrected)
+plotMA(res)
+vsd <- vst(dds, blind=FALSE)
+plotPCA(vsd, intgroup=c("condition"))
+```
+MAplot shows slight slant
+
+```{r}
+# VST normalization
+vsd <- vst(dds, blind = FALSE)
+vsd_mat <- assay(vsd)
+
+# Define meaningful sample names
+sample_names <- c("Amanitin_1", "Amanitin_2", "Amanitin_3", "Water_1", "Water_2", "Water_3")
+colnames(vsd_mat) <- sample_names
+
+# Update coldata to match sample names
+coldata$SampleName <- sample_names
+
+# Extract condition (already re-leveled: water is ref)
+group <- colData(dds)$condition
+
+# Create per-sample MA data
+ma_list <- lapply(seq_along(sample_names), function(i) {
+  sample <- sample_names[i]
+  data.frame(
+    NAME = rownames(vsd_mat),
+    logCPM = rowMeans(vsd_mat),
+    logFC = vsd_mat[, i] - rowMeans(vsd_mat[, -i, drop = FALSE]),
+    Sample = sample,
+    Group = as.character(group[i])
+  )
+})
+
+# Combine and annotate
+ma_df_all <- bind_rows(ma_list) %>%
+  left_join(annots, by = "NAME") %>%
+  mutate(
+    CLASS = replace_na(CLASS, "unclassified"),
+    Sample = factor(Sample, levels = sample_names),
+    Group = factor(Group, levels = c("water", "amanitin"))
+  )
+
+# Identify stable maternal genes for highlighting
+# These are genes with low changes between all samples (logFC) and have high expression (logCPM)
+highlight_genes <- ma_df_all %>%
+  filter(CLASS == "mat") %>%
+  group_by(NAME) %>%
+  filter(all(abs(logFC) < 1), all(logCPM > 1)) %>%
+  ungroup() %>%
+  pull(NAME) %>%
+  unique()
+
+# Mark them in the main data frame
+ma_df_all <- ma_df_all %>%
+  mutate(HIGHLIGHT = ifelse(NAME %in% highlight_genes, "highlight", "normal"))
+
+# Plot per-sample MA with highlights
+ggplot(ma_df_all, aes(x = logCPM, y = logFC)) +
+  geom_point(aes(color = CLASS), size = 0.2, alpha = 0.2) +
+  geom_point(data = subset(ma_df_all, HIGHLIGHT == "highlight"),
+             color = "blue", size = 0.7, alpha = 0.9) +
+  scale_color_manual(values = class_colors) +
+  facet_wrap(~ Sample, nrow = 2) +
+  labs(
+    x = "Mean Expression (VST)",
+    y = "Log Fold Change (Sample vs Others)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+# -----------------------
+# Create global MA data
+ma_global <- as.data.frame(res) %>%
+  rownames_to_column("NAME") %>%
+  left_join(annots, by = "NAME") %>%
+  mutate(CLASS = replace_na(CLASS, "unclassified"))
+
+# Global MA plot (Amanitin vs Water)
+ggplot(ma_global, aes(x = baseMean, y = log2FoldChange)) +
+  geom_point(aes(color = CLASS), size = 1.5, alpha = 0.5) +
+  scale_x_log10() +
+  scale_color_manual(values = class_colors) +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  labs(
+    title = "Global MA Plot (DESeq2)",
+    x = "Mean Expression (baseMean, log10 scale)",
+    y = "Log2 Fold Change (Amanitin vs Water)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+  )
+```
+Create corrected dds for DESeq
+
+```{r}
+# Step 1: Prepare counts matrix
+counts <- purrr::reduce(sample_dfs, full_join, by = "Geneid")
+counts <- column_to_rownames(counts, "Geneid")
+
+# Filter out low-expression genes
+filter <- apply(counts, 1, function(x) length(x[x > 10]) >= 2)
+counts_filtered <- counts[filter, ]
+
+# Separate spike-ins if needed
+spikes <- rownames(counts_filtered)[grep("^ERCC", rownames(counts_filtered))]
+genes  <- setdiff(rownames(counts_filtered), spikes)
+
+# Step 2: Create condition factor with correct reference
+coldata <- data.frame(
+  condition = factor(c("amanitin", "amanitin", "amanitin", 
+                       "water", "water", "water"))
+)
+rownames(coldata) <- colnames(counts_filtered)
+
+# Set 'water' as the reference so log2FC = amanitin - water
+coldata$condition <- relevel(coldata$condition, ref = "water")
+
+# Step 3: Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(counts_filtered),
+  colData = coldata,
+  design = ~ condition
+)
+
+# Estimate size factors using spike-ins if needed
+dds <- estimateSizeFactors(dds, controlGenes = rownames(dds) %in% highlight_genes)
+
+# Run DESeq
+dds <- DESeq(dds)
+
+# Get results (log2FC = amanitin - water)
+res <- results(dds)
+
+# Variance-stabilized transformation for PCA, etc.
+vsd <- vst(dds, blind = FALSE)
+plotPCA(vsd, intgroup = "condition")
+
+# Step 4: Create global MA data
+ma_global <- as.data.frame(res) %>%
+  rownames_to_column("NAME") %>%
+  left_join(annots, by = "NAME") %>%
+  mutate(CLASS = replace_na(CLASS, "unclassified"))
+
+# Step 5: Plot MA plot (no sign flipping needed)
+ggplot(ma_global, aes(x = baseMean, y = log2FoldChange)) +
+  geom_point(aes(color = CLASS), size = 1.5, alpha = 0.6) +
+  scale_x_log10() +
+  scale_color_manual(values = class_colors) +
+  geom_hline(yintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  labs(
+    title = "Global MA Plot (Amanitin Upregulated at Top)",
+    x = "Mean Normalized Expression (log10 scale)",
+    y = "Log2 Fold Change (Amanitin vs Water)"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+  )
+```
+
+
+```{r}
+# Convert DESeq2 results to data frame and annotate
+summary(res)
+
+
+res_df <- as.data.frame(res)
+res_df$NAME <- rownames(res_df)
+
+res_df <- res_df %>%
+  left_join(annots, by = "NAME") %>%
+  mutate(
+    CLASS = replace_na(CLASS, "unclassified"),
+    Significance = case_when(
+      padj < 0.05 & log2FoldChange > 1  ~ "Up_in_Amanitin",   
+      padj < 0.05 & log2FoldChange < -1 ~ "Up_in_Control",
+      TRUE ~ "Not_Sig"
+    )
+  )
+
+
+# Volcano plot
+p1 <- ggplot(res_df, aes(x = -log2FoldChange, y = -log10(pvalue))) +
+  geom_point(aes(color = CLASS, alpha = CLASS), size = 1.8, show.legend = FALSE) +
+  scale_color_manual(values = class_colors) +
+  scale_alpha_manual(values = c(mat = 0.8, zyg = 0.8, matzyg = 0.8, unclassified = 0.25)) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  coord_cartesian(xlim = c(-10, 10)) +
+  labs(
+    title = "α-Amanitin-Up            Control-Up",
+    x = "Log2 Fold Change", 
+    y = "-log10(P-value)"
+  ) +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    plot.title = element_text(size = 12, hjust = 0.5),
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+  )
+
+# Summarize DE gene counts by class and direction
+summary_table <- res_df %>%
+  filter(!is.na(Significance), Significance != "Not_Sig") %>%
+  group_by(CLASS, Significance) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = Significance, values_from = n, values_fill = 0)
+
+# Create pie data
+pie_data <- summary_table %>%
+  pivot_longer(cols = starts_with("Up_"), names_to = "Direction", values_to = "Count") %>%
+  group_by(Direction) %>%
+  mutate(
+    Percent = Count / sum(Count) * 100,
+    csum = rev(cumsum(rev(Percent))),
+    pos = Percent / 2 + lead(csum, 1),
+    pos = if_else(is.na(pos), Percent / 2, pos)
+  )
+
+
+# Pie chart
+p2 <- ggplot(pie_data, aes(x = "", y = Percent, fill = CLASS)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  facet_wrap(~Direction) +
+  geom_label_repel(
+    aes(y = pos, label = Count),
+    color = "white",
+    size = 4.5,
+    nudge_x = 0.7,
+    segment.size = 0.3,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(values = class_colors) +
+  theme_void() +
+  theme(
+    strip.text = element_text(size = 12),
+    aspect.ratio = 1,
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+  )
+
+
+legend_df <- data.frame(CLASS = factor(names(class_colors), levels = names(class_colors)))
+
+legend_plot <- ggplot(legend_df, aes(x = 1, y = 1, fill = CLASS)) +
+  geom_point(size = 0) +
+  scale_fill_manual(
+    name = "Gene Class",
+    values = class_colors,
+    guide = guide_legend(nrow = 1, override.aes = list(shape = 21, size = 5, colour = NA))
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(size = 11),
+    legend.text = element_text(size = 10),
+    legend.spacing.x = unit(0.4, "cm"),
+    legend.key.size = unit(0.6, "cm"),
+    plot.margin = margin(t = -20, b = 0, l = 0, r = 0)
+  ) +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),  # inside plot
+    plot.background = element_rect(fill = "transparent", color = NA),   # outside plot
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+  )
+final_plot <- (p1 + p2) / wrap_elements(legend_plot) + 
+  plot_layout(heights = c(1, 0.05))
+
+final_plot
+```
+
+```{r}
+# Extract PCA data from DESeq2 object
+pca_data <- plotPCA(vsd, intgroup = "condition", returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+# Plot using ggplot2
+ggplot(pca_data, aes(x = PC1, y = PC2, color = condition, label = name)) +
+  geom_point(size = 3, alpha = 1) +
+  #geom_text(vjust = 1.5, size = 3.5, show.legend = FALSE) +
+  scale_color_manual(values = c("water" = "#A7D5E7", "amanitin" = "#D02B3B")) +
+  labs(
+    title = "PCA",
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance")
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14),
+    axis.title = element_text(size = 10),
+    legend.title = element_blank(),
+    legend.position = "bottom"
+  ) + theme(aspect.ratio = 1) +
+  theme(
+    panel.background = element_rect(fill = "transparent", color = NA),  # inside plot
+    plot.background = element_rect(fill = "transparent", color = NA),   # outside plot
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA)
+  )
+
+pca_data
+```
+
+
+```{r}
+sessionInfo()
+```

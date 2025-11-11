@@ -1,0 +1,398 @@
+"""Analysing ATAC data from <Project>."""
+
+from pathlib import Path
+import pandas as pd
+import re
+
+
+#-------------------#
+# Setup
+#-------------------#
+
+configfile: 'config.yaml'
+Path('logs').mkdir(parents=True, exist_ok=True)
+
+# Load meta-file
+metadata = pd.read_csv(config['metafile'], sep='\t')
+if 'run_accession' in metadata.columns:
+    run_ids = metadata['run_accession']
+    samples = metadata['sample_title']
+    sample2id = dict(zip(samples, run_ids))
+else:
+    run_ids = metadata['id']
+    samples = metadata['sample']
+    id2sample = dict(zip(run_ids, samples))
+
+#localrules: multiqc
+
+wildcard_constraints: id = '|'.join(run_ids.tolist())
+
+
+rule all:
+    input:
+        "results/stats/PCA_plot.png",
+        "multiqc/multiqc_report.html",
+        "results/stats/correlation_plot.png",
+        expand(
+            "data/coverage/{sample}_{mappability}_open.bw",
+            sample=samples,
+            mappability=config['quality'].keys()
+        ),
+        expand(
+            "data/coverage/{sample}_{mappability}_mono.bw",
+            sample=samples,
+            mappability=config['quality'].keys()
+        )
+
+
+#-------------------#
+# Dowloading files
+#-------------------#
+
+if 'run_accession' in metadata.columns:
+    rule download:
+        """Download FASTQ files from ENA using wget and check md5 sums."""
+        output:
+            "fastq/{id}_{run}.fastq.gz"
+        threads: 1
+        script:
+            "scripts/download.py"
+
+#-------------------#
+# Trimming
+#-------------------#
+
+rule fastp:
+    """Trim adapters and remove low-quality reads/basecalls."""
+    input:
+        "fastq/{id}_1.fastq.gz",
+        "fastq/{id}_2.fastq.gz"
+    output:
+        "data/trimmed/{id}_1.fastq.gz",
+        "data/trimmed/{id}_2.fastq.gz"
+    params:
+        size = config['fastp']['window_size'],
+        quality = config['fastp']['mean_quality'],
+        report_base = "data/fastp/{id}/fastp"
+    threads: 4
+    script:
+        "scripts/fastp.py"
+
+#-------------------#
+# FASTQ quality control
+#-------------------#
+
+rule raw_fastqc:
+    """Control quality of raw reads using FASTQC."""
+    input:
+        "fastq/{name}.fastq.gz"
+    output:
+        "data/fastqc/untrimmed/{name}_fastqc.zip"
+    threads: 4
+    shell:
+        "fastqc -j /home/linuxbrew/.linuxbrew/Cellar/openjdk/19/bin/java "
+        "-t {threads} -o data/fastqc/untrimmed {input}"
+
+rule trim_fastqc:
+    """Control quality of trimmed reads using FASTQC."""
+    input:
+        "data/trimmed/{name}.fastq.gz"
+    output:
+        "data/fastqc/trimmed/{name}_fastqc.zip"
+    threads: 4
+    shell:
+        "fastqc -j /home/linuxbrew/.linuxbrew/Cellar/openjdk/19/bin/java "
+        "-t {threads} -o data/fastqc/trimmed {input}"
+
+#-------------------#
+# Aligning
+#-------------------#
+
+rule bowtie2:
+    """Align reads to a reference genome with bwa-mem2."""
+    input:
+        rules.fastp.output
+    output:
+        temp("data/alignment/{id}.sam")
+    params:
+        index = config['index']
+    threads: 8
+    script:
+        "scripts/bowtie2.py"
+
+
+#-------------------#
+# SAM to BAM to Final BAM
+#-------------------#
+
+
+rule sambamba_view:
+    """Turn SAM files into BAM using sambamba view."""
+    input:
+        rules.bowtie2.output
+    output:
+        "data/alignment/{id}.bam"
+    threads: 4
+    shell:
+        "sambamba view -t {threads} "
+        "-S -f bam "
+        "-F \"mapping_quality >= 20\" "
+        "-o {output} "
+        "{input}"
+
+
+rule sambamba_sort:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.sambamba_view.output
+    output:
+        bam = "data/alignment/{id}_sorted.bam"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input}"
+
+
+rule sambamba_markdup:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.sambamba_sort.output
+    output:
+        bam = "data/alignment/{id}_noDup.sorted.bam",
+        bai = "data/alignment/{id}_noDup.sorted.bam.bai"
+    threads: 4
+    shell:
+        "sambamba markdup --remove-duplicates "
+        "{input} {output.bam} "
+        "&& "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}"
+
+
+rule deeptools_alignmentsieve_open:
+    """Shift ATAC-seq reads by 9bp to correct for Tn5 cutting with deeptools."""
+    input:
+        bam = rules.sambamba_markdup.output.bam
+    output:
+        "data/alignment_open/{id}_open.bam"
+    threads: 4
+    params:
+        blacklist = config['blacklist']
+    shell:
+        "deeptools --version && "
+        "alignmentSieve -p {threads} "
+        "--ATACshift --blackListFileName {params.blacklist} "
+        "--maxFragmentLength 100 "
+        "--bam {input.bam} --outFile {output}"
+
+
+rule deeptools_alignmentsieve_mono:
+    """Shift ATAC-seq reads by 9bp to correct for Tn5 cutting with deeptools."""
+    input:
+        bam = rules.sambamba_markdup.output.bam
+    output:
+        "data/alignment_mono/{id}_mono.bam"
+    threads: 4
+    params:
+        blacklist = config['blacklist']
+    shell:
+        "deeptools --version && "
+        "alignmentSieve -p {threads} "
+        "--ATACshift --blackListFileName {params.blacklist} "
+        "--minFragmentLength 180 "
+        "--maxFragmentLength 250 "
+        "--bam {input.bam} --outFile {output}"
+
+rule sambamba_sort_open:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.deeptools_alignmentsieve_open.output
+    output:
+        bam = "data/alignment_open/{id}_open.sorted.bam",
+        bai = "data/alignment_open/{id}_open.sorted.bam.bai"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input} && "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}"
+
+rule sambamba_sort_mono:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.deeptools_alignmentsieve_mono.output
+    output:
+        bam = "data/alignment_mono/{id}_mono.sorted.bam",
+        bai = "data/alignment_mono/{id}_mono.sorted.bam.bai"
+    threads: 4
+    shell:
+        "sambamba sort -t {threads} "
+        "-m 5GiB -o {output.bam} "
+        "{input} && "
+        "sambamba index -t {threads} "
+        "{output.bam} {output.bai}"
+
+#-------------------#
+# BAM quality control
+#-------------------#
+
+rule samtools_flagstat:
+    """Get alignment statistics with samtools flagstat."""
+    input:
+        rules.sambamba_sort.output
+    output:
+        "data/stats/{id}.flgst"
+    threads: 2
+    shell:
+        "samtools --version && "
+        "samtools flagstat -@ {threads} "
+        "{input} > {output}"
+
+rule samtools_flagstat_open:
+    """Get alignment statistics with samtools flagstat."""
+    input:
+        rules.sambamba_sort_open.output.bam
+    output:
+        "data/stats_open/{id}_open.flgst"
+    threads: 2
+    shell:
+        "samtools --version && "
+        "samtools flagstat -@ {threads} "
+        "{input} > {output}"
+
+
+rule samtools_flagstat_mono:
+    """Get alignment statistics with samtools flagstat."""
+    input:
+        rules.sambamba_sort_mono.output.bam
+    output:
+        "data/stats_mono/{id}_mono.flgst"
+    threads: 2
+    shell:
+        "samtools --version && "
+        "samtools flagstat -@ {threads} "
+        "{input} > {output}"
+
+
+
+#PCA with titles
+rule multiBamSummary:
+    """Compute read coverages for genomic bins with multiBamSummary."""
+    input:
+        expand(
+            rules.sambamba_sort.output.bam,
+            id=run_ids
+        )
+    output:
+        summary = "data/stats/multiBamSummary.npz",
+        factors = "data/stats/scaling_factors.tsv"
+    threads: 8
+    params:
+        labels = samples.to_list(),
+        blacklist = config['blacklist'],
+        quality = config['quality']['unique']
+    shell:
+        "multiBamSummary --version && "
+        "multiBamSummary bins -p {threads} "
+        "--labels {params.labels} --extendReads "
+        "--minMappingQuality {params.quality} "
+        "--scalingFactors {output.factors} "
+        "--blackListFileName {params.blacklist} "
+        "--bamfiles {input} -o {output.summary}"
+
+rule plotPCA:
+    """Creates PCA plot for BAM files with plotPCA."""
+    input:
+        rules.multiBamSummary.output.summary
+    output:
+        png = "results/stats/PCA_plot.png",
+        tab = "results/stats/PCA_plot.tab"
+    threads: 1
+    shell:
+        "plotPCA --version && "
+        "plotPCA -in {input} -o {output.png} "
+        "--outFileNameData {output.tab}"
+
+#-------------------#
+# Final report
+#-------------------#
+
+rule multiqc:
+    """Collect all quality reports in single report."""
+    input:
+        expand(
+            "data/fastqc/{state}/{id}_{read}_fastqc.zip",
+            state=['untrimmed', 'trimmed'],
+            id=run_ids,
+            read=[1, 2]
+        ),
+        expand(
+            rules.samtools_flagstat.output,
+            id=run_ids
+        ), 
+        expand(
+            rules.samtools_flagstat_mono.output,
+            id=run_ids
+        ),
+        expand(
+            rules.samtools_flagstat_open.output,
+            id=run_ids
+        )
+    output:
+        "multiqc/multiqc_report.html"
+    params:
+        gc = 'mm10_genome'
+    threads: 1
+    shell:
+        "multiqc -f -o multiqc/ -d -dd 1 "
+        "--cl_config 'fastqc_config: {{fastqc_theoretical_gc: {params.gc}}}' "
+        "data/fastp data/fastqc/untrimmed data/fastqc/trimmed data/stats"
+
+
+
+#-------------------#
+# Coverage tracks
+#-------------------#
+
+
+rule bamCoverage_open:
+    """Create bigWig coverage tracks from BAM files with bamCoverage."""
+    input:
+        lambda wc: expand(rules.sambamba_sort_open.output.bam, id=sample2id[wc.sample])
+    output:
+        "data/coverage/{sample}_{mappability}_open.bw"
+    params:
+        blacklist = config['blacklist'],
+        genomesize = lambda wc: config['genomesize'][wc.mappability],
+        quality = lambda wc: config['quality'][wc.mappability]
+    threads: 4
+    shell:
+        "bamCoverage --version && "
+        "bamCoverage -p {threads} "
+        "--binSize 1 --extendReads --minMappingQuality {params.quality} "
+        "--normalizeUsing RPGC --effectiveGenomeSize {params.genomesize} "
+        "--ignoreForNormalization X --blackListFileName {params.blacklist} "
+        "--bam {input} -of bigwig --outFileName {output}"
+
+rule bamCoverage_mono:
+    """Create bigWig coverage tracks from BAM files with bamCoverage."""
+    input:
+        lambda wc: expand(rules.sambamba_sort_mono.output.bam, id=sample2id[wc.sample])
+    output:
+        "data/coverage/{sample}_{mappability}_mono.bw"
+    params:
+        blacklist = config['blacklist'],
+        genomesize = lambda wc: config['genomesize'][wc.mappability],
+        quality = lambda wc: config['quality'][wc.mappability]
+    threads: 4
+    shell:
+        "bamCoverage --version && "
+        "bamCoverage -p {threads} "
+        "--binSize 1 --extendReads --minMappingQuality {params.quality} "
+        "--normalizeUsing RPGC --effectiveGenomeSize {params.genomesize} "
+        "--ignoreForNormalization X --blackListFileName {params.blacklist} "
+        "--bam {input} -of bigwig --outFileName {output}"
+
+

@@ -1,0 +1,167 @@
+from collections import defaultdict
+from pathlib import Path
+import pandas as pd
+import re
+
+
+#-------------------#
+# Setup
+#-------------------#
+
+#After processing and running rna-seq rmd - scale factors are used to balance. 
+
+# Load scale factors
+scale_factors = pd.read_csv("scale_factors.tsv", sep="\t", index_col=0).squeeze().to_dict()
+
+# Function to compute inverse scale
+def get_inverse_scale(sample):
+    return 1.0 / scale_factors[sample]
+
+# Samples list
+samples = list(scale_factors.keys())
+
+
+localrules: all
+
+
+rule all:
+    input:
+        expand("fastq/fastp/{sample}_{rep}.fastp.html",
+            sample = ["treatment", "control"],
+            rep = ["rep1", "rep2", "rep3"]),
+        expand("data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam",
+            sample = ["treatment", "control"],
+            rep = ["rep1", "rep2", "rep3"]),
+        expand("data/simple_counts/{sample}_{rep}_counts.txt",
+            sample = ["treatment", "control"],
+            rep = ["rep1", "rep2", "rep3"]),
+        expand("data/counts/{type}_featureCounts_{sample}_{rep}.txt",
+            type = ["Genes"],
+            sample = ["treatment", "control"],
+            rep = ["rep1", "rep2", "rep3"]),
+        expand("bigwig/{sample}.scaled.bw", sample=samples),
+        expand("{treatment}_average.bw", treatment = ["treatment", "control"])
+
+#-------------------#
+# Processing
+#-------------------#
+
+rule rna_fastp:
+    input:
+        R1 = "fastq/{sample}_{rep}_R1.fastq",
+        R2 = "fastq/{sample}_{rep}_R2.fastq"
+    output:
+        R1="fastq/fastp/trimmed_{sample}_{rep}_R1.fastq",
+        R2= "fastq/fastp/trimmed_{sample}_{rep}_R2.fastq",
+        html="fastq/fastp/{sample}_{rep}.fastp.html"
+    resources:
+        time= "05:00:00",
+        mem= "20G"
+    threads: 3
+    shell:
+        "fastp --in1 {input.R1} --in2 {input.R2} "
+        "--out1 {output.R1} --out2 {output.R2} "
+        "--detect_adapter_for_pe "
+        "--thread {threads} --html {output.html}"
+
+rule rna_align:
+    input:
+        expand("fastq/fastp/trimmed_{{sample}}_{{rep}}_{read}.fastq", 
+            read = ["R1", "R2"])
+    output:
+        "data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam"
+    resources:
+        time= "10:00:00",
+        mem= "10G"
+    threads: 8
+    shell:
+        "STAR --genomeDir /home/nmaziak/mnt/storage/vaquerizas/nmaziak/projects/revisions_droso/functional_picoc/rna/STAR_dm6_refGenegtf/ "
+        "--runThreadN {threads} "
+        "--readFilesIn {input} "
+        "--outFileNamePrefix data/star/{wildcards.sample}_{wildcards.rep}_ "
+        "--outFilterMismatchNoverLmax 0.04 "
+        "--outSAMtype BAM SortedByCoordinate "
+        "--outFilterMultimapNmax 1 "
+        "--outMultimapperOrder Random "
+        "--outSAMmultNmax 1 "
+        "--outSAMunmapped Within "
+        "--outSAMattributes Standard" 
+
+rule sambamba_index:
+    """Sort BAM files by coordinates and index them with sambamba."""
+    input:
+        rules.rna_align.output
+    output:
+        bai = "data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam.bai"
+    resources:
+        time= "05:00:00",
+        mem= "2G"
+    threads: 3
+    shell:
+        "sambamba index -t {threads} "
+        "{input} {output.bai}"
+
+rule count_reads:
+    input: 
+        bam = "data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam",
+        bai = "data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam.bai"
+    output:
+        "data/simple_counts/{sample}_{rep}_counts.txt"
+    shell:
+        "samtools view -c {input.bam} > {output}"
+
+
+rule featureCounts_genes:
+    input:
+        bam = "data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam",
+        bai = "data/star/{sample}_{rep}_Aligned.sortedByCoord.out.bam.bai"
+    output:
+        "data/counts/Genes_featureCounts_{sample}_{rep}.txt"
+    resources:
+        time= "05:00:00",
+        mem= "2G"
+    shell: 
+        "featureCounts "
+        "-p "
+        "-a gtf/dm6.refGene.gtf "
+        "-o {output} "
+        "{input.bam}"
+
+
+#-------------------#
+# DESeq2 post-processing
+#-------------------#
+
+rule bam_to_bigwig:
+    input:
+        bam="data/star/{sample}_Aligned.sortedByCoord.out.bam",
+        bai="data/star/{sample}_Aligned.sortedByCoord.out.bam.bai"
+    output:
+        bw="bigwig/{sample}.scaled.bw"
+    resources:
+        time= "08:15:00",
+        mem= "50G"
+    params:
+        scale=lambda wildcards: get_inverse_scale(wildcards.sample)
+    shell:
+        """
+        bamCoverage \
+            -b {input.bam} \
+            -o {output.bw} \
+            --scaleFactor {params.scale} \
+            --normalizeUsing None \
+            --binSize 1 \
+            --ignoreDuplicates
+        """
+
+rule bigwig_average:
+    input:
+        expand("bigwig/{{treatment}}_{rep}.scaled.bw", rep = ["rep1", "rep2", "rep3"]) 
+    output:
+        "{treatment}_average.bw"
+    resources:
+        time= "08:15:00",
+        mem= "10G"
+    shell:
+        "bigwigAverage -b {input} "
+        "--binSize 1 -o {output}"

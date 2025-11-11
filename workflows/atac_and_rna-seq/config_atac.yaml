@@ -1,0 +1,10 @@
+metafile:
+  "metadata.txt"
+
+fastp: 
+  window_size: 1
+  mean_quality: 20
+
+quality:
+  unique: 10
+  multi: 0
