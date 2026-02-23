@@ -17,7 +17,8 @@ The repository contains the four main computational workflows described in the p
    - Preprocessing, alignment, and quality control of Pico-C datasets.  
    - Generation and normalization of contact maps for downstream analysis.
    - Boundary detection, loop calling, and compartment identification from Pico-C data. Source data and outputs of this analysis are additionally available in the *Supplementary Data* accompanying the manuscript.
-   - This will cover a bulk of the paper's data
+   - Chromosight analysis to quanitfy loop and boundary strength across in controls and abrogatted transcription elongation maps, and mutant maps. 
+   - This will cover a bulk of the paper's data.
    > Note: knockdown Pico-C's and α-Amanitin and their respective controls were processed in the same manner. 
 
 2. **RNA-seq Analysis (α-Amanitin and Control Embryos) and ATAC-seq Processing (Control vs. Zelda–GAF Double Knockdowns)**  
