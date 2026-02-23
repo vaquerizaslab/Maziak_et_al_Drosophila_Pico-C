@@ -1,0 +1,255 @@
+---
+title: "state_enrichment"
+output: html_document
+---
+
+```{r setup-libraries, warning=FALSE, message=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(ggplot2)
+library(patchwork)
+library("TxDb.Dmelanogaster.UCSC.dm6.ensGene")
+library("BSgenome.Dmelanogaster.UCSC.dm6")
+library(data.table)
+library(RColorBrewer)
+library(tidyverse)
+library(scales)
+library(extrafont)
+library(showtext)
+library(purrr)
+library(devtools)
+```
+
+```{r}
+my_colors <- c("#ab0b1e", "#ef8a62", "#fddbc7", "#f7f7f7", "#57b6ea", "#036fad", "#055bb2")
+
+# Create a palette function using colorRampPalette
+my_palette <- colorRampPalette(my_colors)
+
+# Generate a palette with the desired number of colors (e.g., 9)
+custom_palette <- my_palette(11)
+
+# Display the custom palette
+print(custom_palette)
+```
+
+
+```{r}
+process_loops <- function(stage, timepoint) {
+  # Define file paths using Sys.glob
+  loops_files <- Sys.glob(paste0("state_intersect/loops/", stage, "**", timepoint, ".bed"))
+  slop_files <- Sys.glob(paste0("state_intersect/loops/slop/", stage, "**", timepoint, ".150000.bed"))
+  
+  # Read and process slop files
+  slop_data <- map_dfr(slop_files, ~ read_tsv(.x, col_names = c("chrb", "startb", "endb", "chrs", "starts", "ends", "state", "size"), col_types = "fiifiifi"))
+  slop_data <- slop_data %>%
+    mutate(state = sub("state", "", state),
+           stage = stage, 
+           timepoint = timepoint, 
+           stage_timepoint = paste(stage, timepoint, sep = "_"))
+  
+  # Read and process loop files
+  loop_data <- map_dfr(loops_files, ~ read_tsv(.x, col_names = c("chrb", "startb", "endb", "chrs", "starts", "ends", "state", "size"), col_types = "fiifiifi"))
+  loop_data <- loop_data %>%
+    mutate(state = sub("state", "", state),
+           stage = stage, 
+           timepoint = timepoint, 
+           stage_timepoint = paste(stage, timepoint, sep = "_"))
+  
+  # Summarize loop data
+  summary <- loop_data %>%
+    group_by(stage, timepoint, stage_timepoint, state) %>%
+    summarise(size_sum = sum(size), .groups = 'drop') %>%
+    complete(stage, timepoint, stage_timepoint, state, fill = list(size_sum = 0)) %>%
+    group_by(stage_timepoint) %>% 
+    mutate(size_rel.loop = size_sum / sum(size_sum) + 1e-5)
+  
+  # Summarize slop data
+  summary_local <- slop_data %>%
+    group_by(stage, timepoint, stage_timepoint, state) %>%
+    summarise(size_sum = sum(size), .groups = 'drop') %>%
+    complete(stage, timepoint, stage_timepoint, state, fill = list(size_sum = 0)) %>%
+    group_by(stage_timepoint) %>% 
+    mutate(size_rel.slop = size_sum / sum(size_sum) + 1e-5)
+  
+  # Merge summaries and calculate changes
+  merged_summary <- merge(summary, summary_local, by = c("stage", "timepoint", "stage_timepoint", "state"), suffixes = c(".loops", ".slop"))
+  merged_summary <- merged_summary %>%
+    mutate(obsoexp = size_rel.loop / size_rel.slop,
+           log_change = log2(obsoexp))
+  
+  return(merged_summary)
+}
+
+
+nc14_zlddep <- process_loops("NC14", "zlddep")
+nc14_mbt <- process_loops("NC14", "MBT")
+nc13_prembtb <- process_loops("NC13", "preMBTb")
+nc12_prembtb <- process_loops("NC12", "preMBTb")
+nc11_prembta <- process_loops("NC11", "preMBTa")
+nc10_prembta <- process_loops("NC10", "preMBTa")
+nc9_prembta <- process_loops("NC9", "preMBTa")
+
+combined_data <- bind_rows(nc14_zlddep, nc14_mbt, nc13_prembtb, nc12_prembtb, nc11_prembta, nc10_prembta) %>% 
+  group_by(stage_timepoint) %>% 
+  mutate(scaled_observed = as.double(scale(obsoexp)))
+
+state_order <- combined_data %>%
+  filter(stage_timepoint == "NC14_MBT") %>%
+  arrange(desc(log_change)) %>%
+  pull(state)
+
+combined_data <- combined_data %>%
+  mutate(state = factor(state, levels = state_order))
+
+cols <- brewer.pal(n = 9, name = "RdBu") 
+
+custom_labels <- c(
+  "NC14_zlddep" = "NC14 Zld(-)",
+  "NC14_MBT" = "NC14",
+  "NC13_preMBTb" = "NC13",
+  "NC12_preMBTb" = "NC12",
+  "NC11_preMBTa" = "NC11",
+  "NC10_preMBTa" = "NC10"
+)
+combined_data
+loop_anchors = ggplot(combined_data, aes(x = state, y = stage_timepoint)) +
+  geom_tile(aes(fill = log_change),
+            color = "white", linewidth = 0.6) +
+  scale_fill_gradientn(
+    colours = rev(cols),
+    limits = c(-2, 3),
+    oob = scales::squish,
+    rescaler = ~ scales::rescale_mid(.x, mid = 0)
+  ) +
+  theme_bw() +
+  scale_y_discrete(labels = custom_labels) +
+  scale_x_discrete(guide = guide_axis(angle = 50)) +
+  coord_fixed() +
+  theme(legend.key.size = unit(0.24, "cm")) +
+  labs(fill = "log2(obs/exp)")
+
+loop_anchors
+
+#write.table(p$data, file = "loops_state_enrich.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+#ggsave("loops_enrich_log2.pdf", width = 5, height = 2, dpi = 400)
+```
+
+
+```{r}
+process_boundaries <- function(stage, timepoint) {
+  # Define file paths using Sys.glob
+  bound_files <- Sys.glob(paste0("state_intersect/boundaries/", stage, "*", timepoint, ".bed"))
+  slop_files <- Sys.glob(paste0("state_intersect/boundaries/slop/", stage, "*", timepoint, ".150000.bed"))
+  
+  # Read and process slop files
+  slop_data <- map_dfr(slop_files, ~ read_tsv(.x, col_names = c("chrb", "startb", "endb", "strand", "score", "type", "chrs", "starts", "ends", "state", "size"), col_types = "fiiffffiifi"))
+  slop_data <- slop_data %>%
+    mutate(state = sub("state", "", state),
+           stage = stage, 
+           timepoint = timepoint, 
+           stage_timepoint = paste(stage, timepoint, sep = "_"))
+  
+  # Read and process boundary files
+  bound_data <- map_dfr(bound_files, ~ read_tsv(.x, col_names = c("chrb", "startb", "endb", "strand", "score", "type", "chrs", "starts", "ends", "state", "size"), col_types = "fiiffffiifi"))
+  bound_data <- bound_data %>%
+    mutate(state = sub("state", "", state),
+           stage = stage, 
+           timepoint = timepoint, 
+           stage_timepoint = paste(stage, timepoint, sep = "_"))
+  
+  # Summarize boundary data
+  summary <- bound_data %>%
+    group_by(stage, timepoint, stage_timepoint, state) %>%
+    summarise(size_sum = sum(size), .groups = 'drop') %>%
+    complete(stage, timepoint, stage_timepoint, state, fill = list(size_sum = 0)) %>%
+    group_by(stage) %>% 
+    mutate(size_rel.loop = size_sum / sum(size_sum) + 1e-5)
+  
+  # Summarize slop data
+  summary_local <- slop_data %>%
+    group_by(stage, timepoint, stage_timepoint, state) %>%
+    summarise(size_sum = sum(size), .groups = 'drop') %>%
+    complete(stage, timepoint, stage_timepoint, state, fill = list(size_sum = 0)) %>%
+    group_by(stage) %>% 
+    mutate(size_rel.slop = size_sum / sum(size_sum) + 1e-5)
+  
+  # Merge summaries and calculate changes
+  merged_summary <- merge(summary, summary_local, by = c("stage", "timepoint", "stage_timepoint", "state"), suffixes = c(".loops", ".slop"))
+  merged_summary <- merged_summary %>%
+    mutate(obsoexp = size_rel.loop / size_rel.slop,
+           log_change = log2(obsoexp))
+  
+  return(merged_summary)
+}
+
+
+
+nc14_zlddep <- process_boundaries("NC14", "zlddep")
+nc14_mbt <- process_boundaries("NC14", "MBT")
+nc13_prembtb <- process_boundaries("NC13", "preMBTb")
+nc12_prembtb <- process_boundaries("NC12", "preMBTb")
+nc11_prembta <- process_boundaries("NC11", "preMBTa")
+nc10_prembta <- process_boundaries("NC10", "preMBTa")
+nc9_prembta <- process_boundaries("NC9", "preMBTa")
+
+combined_data <- bind_rows(nc14_zlddep, nc14_mbt, nc13_prembtb, nc12_prembtb, nc11_prembta, nc10_prembta, nc9_prembta) %>% 
+  group_by(stage_timepoint) %>% 
+  mutate(scaled_observed = as.double(scale(obsoexp)))
+
+state_order <- combined_data %>%
+  filter(stage_timepoint == "NC14_MBT") %>%
+  arrange(desc(log_change)) %>%
+  pull(state)
+
+
+desired_order <- c(
+  "NC9_preMBTa", "NC10_preMBTa", "NC11_preMBTa", "NC12_preMBTb", 
+  "NC13_preMBTb", "NC14_MBT", "NC14_zlddep"
+)
+
+combined_data <- combined_data %>%
+  mutate(stage_timepoint = factor(stage_timepoint, levels = desired_order))
+
+combined_data <- combined_data %>%
+  mutate(state = factor(state, levels = state_order))
+
+
+custom_labels <- c(
+  "NC14_zlddep" = "NC14 Zld(-)",
+  "NC14_MBT" = "NC14",
+  "NC13_preMBTb" = "NC13",
+  "NC12_preMBTb" = "NC12",
+  "NC11_preMBTa" = "NC11",
+  "NC10_preMBTa" = "NC10", 
+  "NC9_preMBTa" = "NC9"
+)
+
+boundaries = ggplot(combined_data, aes(x = state, y = stage_timepoint)) +
+  geom_tile(aes(fill = log_change), color = "white", size = 0.6) +
+  scale_fill_gradientn(colours = rev(custom_palette), 
+                       #breaks = c(-1.5, 0, 1.5),
+                       #labels = c("-1.5", "0", "3"),
+                       limits = c(-2, 3),
+                       oob = scales::squish,
+                       rescaler = ~ scales::rescale_mid(.x, mid = 0)) +
+  theme_bw() +
+  scale_y_discrete(labels = custom_labels) +
+  scale_x_discrete(guide = guide_axis(angle = 50)) +
+  coord_fixed() +
+  theme(legend.key.size = unit(0.24, "cm")) +
+  labs(fill = "log2(obs/exp)") 
+
+boundaries
+
+#write.table(p$data, file = "boundary_state_enrich.tsv", sep = "\t", row.names = FALSE, quote = FALSE)
+#ggsave("boundaries_enrich_log2.pdf", width = 5, height = 2, dpi = 400)
+```
+
+```{r}
+devtools::session_info()
+```
+
