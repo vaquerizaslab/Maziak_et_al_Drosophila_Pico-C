@@ -1,0 +1,271 @@
+---
+title: "Chromosight Loop Analysis for DKD vs controls"
+output: html_document
+---
+
+```{r setup-libraries, warning=FALSE, message=FALSE}
+library(ggpubr)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(grid)
+library(dplyr)
+library(devtools)
+```
+
+```{r, warning=FALSE}
+#import
+CT <- read.table("data/loops/JabbaCT_all_loops.tsv", header = TRUE, sep = "\t")
+DKD <- read.table("data/loops/Jabba_all_loops.tsv", header = TRUE, sep = "\t")
+
+#keep score
+CT <- CT %>% dplyr::select(chrom1, start1, end1,chrom2, start2, end2, score_CT = score)
+DKD <- DKD %>% dplyr::select(chrom1, start1, end1, chrom2, start2, end2, score_DKD = score)
+
+# combine
+merged <- inner_join(CT, DKD, by = c("chrom1", "start1", "end1", "chrom2", "start2", "end2"))
+
+anchors1 <- merged %>%
+  transmute(
+    chrom = chrom1,
+    start = start1,
+    end = end1,
+    score_CT = score_CT,
+    score_DKD = score_DKD
+  )
+
+# Step 2: For anchor 2
+anchors2 <- merged %>%
+  transmute(
+    chrom = chrom2,
+    start = start2,
+    end = end2,
+    score_CT = score_CT,
+    score_DKD = score_DKD
+  )
+
+# Step 3: Combine into one BED-style data frame
+bed_df <- bind_rows(anchors1, anchors2)
+
+cluster <- read.table("data/NC14_250_1kb_2kb_4kb_16kb.clean.bed", 
+                      sep = "\t", 
+                      header = FALSE,
+                      stringsAsFactors = FALSE)
+
+colnames(cluster) <- c("chrom", "start", "end", "cluster")
+
+annotated <- bed_df %>%
+  left_join(cluster, by = c("chrom", "start", "end"))
+duplicates <- bed_df %>%
+  group_by(chrom, start, end) %>%
+  filter(n() > 1) #to check 
+
+# Filter to keep only anchors that had a matching cluster
+annotated_filtered <- annotated %>%
+  filter(!is.na(cluster) & cluster != ".")
+
+cluster_colors <- c(
+  "1" = "#1395BA",
+  "2" = "#0F5B78",
+  "3" = "#C02E1D",
+  "4" = "#D94E1F",
+  "5" = "#F16C20",
+  "6" = "#A2B86C",
+  "7" = "#5CA793"
+)
+
+long_df <- annotated_filtered %>%
+  dplyr::select(chrom, start, end, score_CT, score_DKD, cluster) %>%
+  pivot_longer(cols = c(score_CT, score_DKD),
+               names_to = "condition", values_to = "score") %>%
+  mutate(condition = ifelse(condition == "score_CT", "CT", "DKD"),
+         condition = factor(condition, levels = c("CT", "DKD")),
+         cluster = as.factor(cluster))
+
+# Compute means per cluster and condition
+cluster_means <- long_df %>%
+  group_by(cluster, condition) %>%
+  summarise(mean_score = mean(score, na.rm = TRUE), .groups = "drop")
+
+# Pivot to wide and compute delta
+mean_wide <- cluster_means %>%
+  pivot_wider(names_from = condition, values_from = mean_score) %>%
+  mutate(delta = DKD - CT)
+
+# Wilcoxon test per cluster
+cluster_tests <- annotated_filtered %>%
+  group_by(cluster) %>%
+  summarise(
+    p_value = wilcox.test(score_DKD, score_CT, paired = FALSE)$p.value,
+    median_delta = median(score_DKD - score_CT, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    adj_p = p.adjust(p_value, method = "BH"),
+    sig_label = case_when(
+      adj_p < 0.001 ~ "***",
+      adj_p < 0.01 ~ "**",
+      adj_p < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    cluster_label = paste0("Cluster ", cluster, " (n = ", n, ")")
+  )
+
+# Join cluster stats to long_df and mean_wide
+long_df <- long_df %>%
+  left_join(cluster_tests %>% dplyr::select(cluster, cluster_label), by = "cluster")
+
+mean_wide <- mean_wide %>%
+  left_join(cluster_tests %>% dplyr::select(cluster, cluster_label, sig_label), by = "cluster") %>%
+  mutate(label = paste0("Δ = ", round(delta, 2), " ", sig_label))
+
+pval_df <- mean_wide %>%
+  mutate(
+    group1 = "CT",
+    group2 = "DKD",
+    y.position = 1.05,
+    p.adj = sig_label
+  ) %>%
+  dplyr::select(group1, group2, y.position, p.adj, cluster_label)
+
+
+ggplot(long_df, aes(x = condition, y = score)) +
+  # Rasterized jitter (colored by cluster)
+    geom_jitter(aes(color = cluster),
+                width = 0.2, alpha = 0.2, size = 1) +
+
+  # Transparent boxplot
+  geom_boxplot(aes(group = condition),
+               outlier.shape = NA, width = 0.4,
+               fill = NA, color = "black", linewidth = 0.4) +
+  geom_text(data = mean_wide,
+            aes(x = 1.5, y = pmax(CT, DKD) + 0.37,
+                label = paste0("Δ = ", round(delta, 2))),
+            inherit.aes = FALSE,
+            size = 3.5, fontface = "bold", color = "black") +
+  stat_pvalue_manual(
+    pval_df,
+    label = "p.adj",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = 0.8,
+    tip.length = 0.01,
+    size = 5
+  ) +
+  scale_color_manual(values = cluster_colors) +
+  facet_wrap(~ cluster_label) +
+  coord_cartesian(ylim = c(-0.3, 1)) +
+  theme_minimal() +
+  labs(
+    title = "Loop-anchor Score Changes per Cluster",
+    x = "Condition",
+    y = "Boundary Score",
+    color = "Cluster"
+  )
+```
+```{r, warning=FALSE}
+#import
+CT <- read.table("data/loops/JabbaCT_all_loops.tsv", header = TRUE, sep = "\t")
+DKD <- read.table("data/loops/Jabba_all_loops.tsv", header = TRUE, sep = "\t")
+
+#keep score
+CT <- CT %>% dplyr::select(chrom1, start1, end1,chrom2, start2, end2, score_CT = score)
+DKD <- DKD %>% dplyr::select(chrom1, start1, end1, chrom2, start2, end2, score_DKD = score)
+
+# combine
+merged_nc14  <- inner_join(CT, DKD, by = c("chrom1", "start1", "end1", "chrom2", "start2", "end2"))
+
+# Flatten anchors (anchor1 + anchor2 into one table)
+anchors1 <- merged_nc14 %>%
+  transmute(chrom = chrom1, start = start1, end = end1,
+            score_CT, score_DKD)
+anchors2 <- merged_nc14 %>%
+  transmute(chrom = chrom2, start = start2, end = end2,
+            score_CT, score_DKD)
+
+# all_anchors <- bind_rows(anchors1, anchors2)
+all_anchors <- bind_rows(anchors1, anchors2) %>% distinct()
+
+# --- Cluster annotation ---
+cluster_map <- read.table("data/NC14_250_1kb_2kb_4kb_16kb.clean.bed",
+                          sep = "\t", header = FALSE, stringsAsFactors = FALSE,
+                          col.names = c("chrom","start","end","cluster")) %>%
+  filter(!is.na(cluster), cluster != ".") %>%
+  mutate(cluster = as.character(cluster)) %>%
+  distinct(chrom, start, end, .keep_all = TRUE)
+
+# Annotate anchors with cluster info
+all_anchors_annot <- all_anchors %>%
+  inner_join(cluster_map, by = c("chrom","start","end"))
+
+# --- Prep data for plotting ---
+eps <- 1e-9
+cluster_levels <- as.character(1:7)
+cluster_colors <- c("1"="#1395BA","2"="#0F5B78","3"="#C02E1D",
+                    "4"="#D94E1F","5"="#F16C20","6"="#A2B86C","7"="#5CA793")
+
+# --- Factor levels in natural order (1 → 7) ---
+dat <- all_anchors_annot %>%
+  mutate(cluster    = factor(as.character(cluster), levels = cluster_levels),
+         change_idx = (score_CT - score_DKD) / (abs(score_CT) + abs(score_DKD) + eps)) %>%
+  filter(!is.na(change_idx))
+
+bounds <- dat %>%
+  group_by(cluster) %>%
+  summarise(
+    q1   = quantile(change_idx, 0.25, na.rm = TRUE),
+    q3   = quantile(change_idx, 0.75, na.rm = TRUE),
+    iqr  = q3 - q1,
+    low  = q1 - 1.5 * iqr,
+    high = q3 + 1.5 * iqr,
+    .groups = "drop"
+  )
+
+violin_dat <- dat %>%
+  inner_join(bounds, by = "cluster") %>%
+  filter(change_idx >= low, change_idx <= high)
+
+clust_stats <- dat %>%
+  group_by(cluster) %>%
+  summarise(med = median(change_idx, na.rm = TRUE),
+            mn  = mean(change_idx,   na.rm = TRUE),
+            .groups = "drop")
+
+# --- Flipped plot (clusters on x, change_idx on y) ---
+
+alpha_fixed <- 0.35
+p_change <- ggplot(dat, aes(x = cluster, y = change_idx)) +
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.3, color = "grey40") +
+  ggrastr::geom_point_rast(
+    aes(color = cluster),
+    position = position_jitter(width = 0.25, height = 0),
+    size = 0.8, alpha = alpha_fixed,
+    raster.dpi = 400, show.legend = FALSE
+  ) +
+  geom_point(data = clust_stats, aes(x = cluster, y = mn),
+             inherit.aes = FALSE, shape = 23, size = 2.4,
+             fill = "white", stroke = 0.6, color = "black") +
+  geom_point(data = clust_stats, aes(x = cluster, y = med),
+             inherit.aes = FALSE, shape = 21, size = 2.2,
+             fill = "white", stroke = 0.6, color = "black") +
+  geom_violin(data = violin_dat, orientation = "x", width = 0.7,
+              trim = TRUE, fill = NA, color = "black", linewidth = 0.5) +
+  scale_x_discrete(limits = cluster_levels) +  # 1 → 7 left to right
+  scale_color_manual(values = cluster_colors,
+                     breaks = cluster_levels, drop = FALSE) +
+  coord_cartesian(ylim = c(-1, 1)) +
+  labs(
+    title = "Normalized change by cluster",
+    subtitle = "y = (CT − DKD) / (|CT| + |DKD|)",
+    x = "Cluster",
+    y = "Normalized change"
+  ) +
+  theme_minimal() +
+  theme(panel.grid.major.x = element_blank())
+p_change
+```
+```{r}
+devtools::session_info()
+```
+

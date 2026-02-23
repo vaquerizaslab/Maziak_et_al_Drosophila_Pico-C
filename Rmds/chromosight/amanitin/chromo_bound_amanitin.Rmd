@@ -1,0 +1,258 @@
+---
+title: "Chromosight Boundary Analysis for amanitin treatment vs H2O controls"
+output: html_document
+---
+
+
+```{r setup-libraries, warning=FALSE, message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readr)
+library(grid)
+library(fuzzyjoin)
+library(ggridges)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(biomaRt)
+library(ggpubr)
+library(ggrastr)
+```
+
+
+### For plotting violin plots
+```{r, warning=FALSE}
+#import
+h2o <- read.table("data/boundaries/H2O_500_sub187837762.tsv", header = TRUE, sep = "\t")
+aman <- read.table("data/boundaries/amanitin_500_sub187837762.tsv", header = TRUE, sep = "\t")
+
+#keep score
+h2o <- h2o %>% dplyr::select(chrom1, start1, end1, score_h2o = score)
+aman <- aman %>% dplyr::select(chrom1, start1, end1, score_aman = score)
+
+# combine
+merged <- inner_join(h2o, aman, by = c("chrom1", "start1", "end1"))
+
+cluster_df <- read.table("data/boundary_clust.bed", header = FALSE, sep = "\t",
+                         col.names = c("chrom", "start", "end", "cluster", "na1", "na2", "na3", "na4", "rgb"))
+
+cluster_df <- cluster_df %>%
+  mutate(hex = rgb(
+    red = as.numeric(sub(",.*", "", rgb)) / 255,
+    green = as.numeric(sub(".*,", "", sub(",[^,]*$", "", rgb))) / 255,
+    blue = as.numeric(sub(".*,", "", rgb)) / 255
+  ))
+
+merged <- merged %>%
+  left_join(cluster_df, by = c("chrom1" = "chrom", "start1" = "start", "end1" = "end"))
+
+merged <- merged %>% filter(cluster != ".")
+
+long_df <- merged %>%
+  pivot_longer(cols = c(score_h2o, score_aman),
+               names_to = "condition",
+               values_to = "score") %>%
+  mutate(condition = recode(condition,
+                            "score_h2o" = "H2O",
+                            "score_aman" = "Amanitin")) 
+
+
+
+# Ensure correct condition order
+long_df$condition <- factor(long_df$condition, levels = c("H2O", "Amanitin"))
+
+# --- Compute mean scores per cluster and condition ---
+cluster_means <- long_df %>%
+  group_by(cluster, condition) %>%
+  summarise(mean_score = mean(score, na.rm = TRUE), .groups = "drop")
+
+# Pivot to wide format and calculate delta
+mean_wide <- cluster_means %>%
+  pivot_wider(names_from = condition, values_from = mean_score) %>%
+  mutate(delta = Amanitin - H2O)
+
+# --- Compute per-cluster stats (Wilcoxon test, n, significance) ---
+cluster_tests <- merged %>%
+  group_by(cluster) %>%
+  summarise(
+    p_value = wilcox.test(score_aman, score_h2o, paired = FALSE)$p.value,
+    median_delta = median(score_aman - score_h2o, na.rm = TRUE),
+    n = dplyr::n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    adj_p = p.adjust(p_value, method = "BH"),
+    sig_label = case_when(
+      adj_p < 0.001 ~ "***",
+      adj_p < 0.01 ~ "**",
+      adj_p < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    cluster_label = paste0("Cluster ", cluster, " (n = ", n, ")"),
+    biologically_relevant = abs(median_delta) >= 0.1 & adj_p < 0.05
+  )
+
+# --- Join stats into mean_wide for plotting ---
+mean_wide <- mean_wide %>%
+  left_join(cluster_tests %>% dplyr::select(cluster, cluster_label, sig_label, adj_p, n), by = "cluster") %>%
+  mutate(label = paste0("Δ = ", round(delta, 2), " ", sig_label))
+
+# --- Add cluster_label to long_df for faceting ---
+long_df <- long_df %>%
+  left_join(cluster_tests %>% dplyr::select(cluster, cluster_label), by = "cluster")
+
+
+pval_df <- mean_wide %>%
+  mutate(
+    group1 = "H2O",
+    group2 = "Amanitin",
+    y.position = 1.1,  # adjust upward if needed to avoid overlap
+    p.adj = sig_label  # or use adj_p if you prefer numeric p-values
+  ) %>%
+  dplyr::select(group1, group2, y.position, p.adj, cluster_label)
+
+
+ggplot(long_df, aes(x = condition, y = score)) +
+  # Jittered points behind
+   geom_jitter(aes(color = hex),
+              width = 0.2, alpha = 0.3, size = 1) +
+
+  # Transparent boxplot on top
+  geom_boxplot(aes(group = condition),
+               outlier.shape = NA, width = 0.4,
+               fill = NA, color = "black", linewidth = 0.4) +
+  geom_text(data = mean_wide,
+          aes(x = 1.5, y = pmax(H2O, Amanitin) + 0.5,
+              label = paste0("Δ = ", round(delta, 2))),
+          inherit.aes = FALSE,
+          size = 3.5, fontface = "bold", color = "black") +
+
+  # Significance bar with stars
+  stat_pvalue_manual(
+    pval_df,
+    label = "p.adj",  # should be "*", "**", etc.
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    size = 3.5
+  ) +
+
+  scale_color_identity() +
+  facet_wrap(~ cluster_label) +
+  coord_cartesian(ylim = c(-0.3, 1.2)) +  # raise if labels overlap
+  theme_minimal() +
+  labs(
+    title = "Boundary Score Changes per Cluster",
+    #subtitle = "Δ = Amanitin - H2O | Arrows show mean change | Stars show significance",
+    x = "Condition",
+    y = "Boundary Score"
+  )
+
+#jitter gives slightly different plotting for same results. 
+```
+
+### Now on to plot ratios
+```{r, warning=FALSE}
+#import
+h2o <- read.table("data/boundaries/H2O_500_sub187837762.tsv", header = TRUE, sep = "\t")
+aman <- read.table("data/boundaries/amanitin_500_sub187837762.tsv", header = TRUE, sep = "\t")
+
+#keep score
+h2o <- h2o %>% dplyr::select(chrom1, start1, end1, score_h2o = score)
+aman <- aman %>% dplyr::select(chrom1, start1, end1, score_aman = score)
+
+# combine
+merged <- inner_join(h2o, aman, by = c("chrom1", "start1", "end1"))
+
+# --- Cluster annotation ---
+cluster_df <- read.table("data/boundary_clust.bed", header = FALSE, sep = "\t",
+                         col.names = c("chrom1", "start1", "end1", "cluster", "na1", "na2", "na3", "na4", "rgb"))
+
+cluster_map <- cluster_df %>%
+  mutate(hex = rgb(
+    red = as.numeric(sub(",.*", "", rgb)) / 255,
+    green = as.numeric(sub(".*,", "", sub(",[^,]*$", "", rgb))) / 255,
+    blue = as.numeric(sub(".*,", "", rgb)) / 255
+  ))
+
+# Annotate anchors with cluster info
+all_anchors_annot <- merged %>%
+  inner_join(cluster_map, by = c("chrom1","start1","end1"))
+
+eps <- 1e-9
+
+boundaries_dat <- all_anchors_annot %>%
+  as_tibble() %>%
+  dplyr::select(chrom = chrom1, start = start1, end = end1,
+         score_h2o, score_aman, cluster, hex) %>%
+  filter(!is.na(cluster), cluster != ".") %>%  
+  mutate(
+    cluster   = factor(as.character(cluster)), # nine clusters
+    change_idx = (score_h2o - score_aman) / (abs(score_h2o) + abs(score_aman) + eps)
+  ) %>%
+  filter(!is.na(change_idx))
+
+# --- 2) Trim extremes for violin outline ---
+bounds <- boundaries_dat %>%
+  group_by(cluster) %>%
+  summarise(
+    q1   = quantile(change_idx, 0.25, na.rm = TRUE),
+    q3   = quantile(change_idx, 0.75, na.rm = TRUE),
+    iqr  = q3 - q1,
+    low  = q1 - 1.5 * iqr,
+    high = q3 + 1.5 * iqr,
+    .groups = "drop"
+  )
+
+violin_dat <- boundaries_dat %>%
+  inner_join(bounds, by = "cluster") %>%
+  filter(change_idx >= low, change_idx <= high)
+
+# --- 3) Stats from full data ---
+clust_stats <- boundaries_dat %>%
+  group_by(cluster) %>%
+  summarise(
+    med = median(change_idx, na.rm = TRUE),
+    mn  = mean(change_idx,   na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- 4) Plot ---
+
+alpha_fixed <- 0.35
+
+p_boundaries <- ggplot(boundaries_dat, aes(x = cluster, y = change_idx)) +
+  geom_hline(yintercept = 0, linetype = 2, linewidth = 0.3, color = "grey40") +
+  ggrastr::geom_point_rast(
+    aes(color = hex),
+    position = position_jitter(width = 0.25, height = 0),
+    size = 0.8, alpha = alpha_fixed,
+    raster.dpi = 400, show.legend = FALSE
+  ) +
+  geom_point(data = clust_stats, aes(x = cluster, y = mn),
+             inherit.aes = FALSE, shape = 23, size = 2.4,
+             fill = "white", stroke = 0.6, color = "black") +
+  geom_point(data = clust_stats, aes(x = cluster, y = med),
+             inherit.aes = FALSE, shape = 21, size = 2.2,
+             fill = "white", stroke = 0.6, color = "black") +
+  geom_violin(data = violin_dat, orientation = "x", width = 0.7,
+              trim = TRUE, fill = NA, color = "black", linewidth = 0.5) +
+  scale_x_discrete(drop = FALSE) +  # ensures all clusters 1–9 appear
+  scale_color_identity() +          # directly use hex column
+  coord_cartesian(ylim = c(-1, 1)) +
+  labs(
+    title = "Normalized change at boundaries by cluster",
+    subtitle = "y = (H₂O − aman) / (|H₂O| + |aman|). >0 ⇒ stronger in water; <0 ⇒ stronger in aman.",
+    x = "Cluster",
+    y = "Normalized change (bounded in [−1, 1])"
+  ) +
+  theme_minimal() +
+  theme(panel.grid.major.x = element_blank())
+
+p_boundaries
+```
+
+```{r session-info}
+devtools::session_info()
+```
