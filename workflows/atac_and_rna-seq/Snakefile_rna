@@ -75,7 +75,7 @@ rule rna_align:
         mem= "10G"
     threads: 8
     shell:
-        "STAR --genomeDir /home/nmaziak/mnt/storage/vaquerizas/nmaziak/projects/revisions_droso/functional_picoc/rna/STAR_dm6_refGenegtf/ "
+        "STAR --genomeDir genomes/STAR_dm6_refGenegtf/ "
         "--runThreadN {threads} "
         "--readFilesIn {input} "
         "--outFileNamePrefix data/star/{wildcards.sample}_{wildcards.rep}_ "
