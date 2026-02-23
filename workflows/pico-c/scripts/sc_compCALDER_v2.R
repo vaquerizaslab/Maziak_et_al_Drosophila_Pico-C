@@ -6,7 +6,7 @@
 library(optparse)
 library(CALDER)
 # library.path <- .libPaths()
-# library(CALDER, lib.loc = '/home/slloren/R/x86_64-pc-linux-gnu-library/4.1')
+# library(CALDER, lib.loc = '/R/x86_64-pc-linux-gnu-library/4.1')
 
 ## Set up arguments
 option_list = list(
@@ -103,11 +103,6 @@ CALDER(contact_file_dump = contact_file_dump_list,
         sub_domains=FALSE,
         save_intermediate_data=TRUE,
         n_cores=1)
-
-
-## Run like: Rscript --vanilla sc_subcompCALDERarg.R -f ${CONTACT_FILE} -c ${CHROM} -b ${BINSIZE} -o ${OUTFOLDER}
-## e.g.,
-## Rscript --vanilla sc_subcompCALDERarg.R -f scripts/20220420_EvaXenlae_HiC_subcompartmentsCalder/Endoderm_q42_500kb_downsample_filt_chr7S_MatrixRegions_slim.txt -c 7S -b 500kb -o tmp/20220420_CALDERtest/xlae10_chr7S_Rarg
 
 
 message(date())
