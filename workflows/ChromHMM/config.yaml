@@ -11,7 +11,7 @@ quality:
 
 
 index:
-  "/home/research/vaquerizas/store/genomes/insects/Dmel/ucsc/Bowtie2Index/genome"
+  "genomes/Bowtie2Index/genome"
 
 
 blacklist:
