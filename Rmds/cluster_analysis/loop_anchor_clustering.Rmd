@@ -1,0 +1,980 @@
+---
+title: "Clustering of loop anchors"
+author: "Fabian"
+date: "2025-04-17"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(GenomicRanges)
+library(rtracklayer)
+
+library(stringr)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrastr)
+
+library(NbClust)
+library(uwot)
+
+set.seed(14)
+
+data_dir <- "path_to_files"
+
+cluster_colours6 <- c(
+  "#1395BA",
+  "#0D3C55",
+  "#C02E1D",
+  "#F16C20",
+  "#EBC844",
+  "#A2B86C"
+)
+
+cluster_colours12 <- c(
+  # "#a2b86c",
+  # "#5ca793",
+  "#1395ba",
+  # "#117899",
+  "#0f5b78",
+  # "#0d3c55",
+  "#c02e1d",
+  "#d94e1f",
+  "#f16c20",
+  # "#ecaa38",
+  "#a2b86c",
+  "#5ca793",
+  "#ef8b2c",
+  "#ebc844"
+)
+
+# Change this to TRUE to run the code for optimising clusters
+optimise_clusters <- FALSE
+```
+
+
+```{r}
+# Load a dataframe of all loop anchors
+anchors_df <- read_tsv(
+  file.path(data_dir, "loop_calls/NC14_250_1kb_2kb_4kb_16kb.clean.bed"),
+  col_names = c("chrom1", "start1", "end1", "chrom2", "start2", "end2"),
+  col_types = "fiifii"
+) %>% 
+  mutate(
+    loop_id = row_number(),
+    midpoint1 = start1 + ((end1 - start1) / 2),
+    midpoint2 = start2 + ((end2 - start2) / 2),
+    distance = abs(midpoint2 - midpoint1)
+  ) %>% 
+  filter(distance < 500000)
+
+
+# Load the boundaries for NC14
+anchors <- list(
+  anchors_df[1:3],
+  anchors_df[4:6]
+) %>% 
+  lapply(
+    `colnames<-`,
+    c("chrom", "start", "end", "loop_id")
+  ) %>% 
+  bind_rows() %>% 
+  makeGRangesFromDataFrame()
+anchors$loop_id <- anchors_df$loop_id
+anchors$anchor_id <- 1:length(anchors)
+
+export.bed(anchors, "anchors/anchors_filtered.bed")
+
+# Merge overlapping anchors
+anchors_merged <- reduce(anchors + 500)
+
+export.bed(anchors, "anchors/anchors_reduced.bed")
+
+
+# Get the size of the regions
+region_width <- 5000
+half_width <- floor(region_width / 2)
+
+# Extend the anchors to be all of the same size (16Kb, size of largest anchors)
+anchors_ext <- resize(anchors_merged, region_width, fix = "center")
+export.bed(anchors_ext, "anchors/anchors_resized.bed")
+```
+
+
+```{r}
+ggplot(anchors_df) +
+  geom_vline(xintercept = c(40000, 500000), linetype = 2, colour = c("grey60", "red")) +
+  geom_density(aes(x = distance), adjust = 0.7) +
+  scale_x_continuous(
+    trans = "log10",
+    labels = scales::label_number(scale_cut = scales::cut_short_scale())
+  ) +
+  scale_y_continuous(
+    expand = expansion(c(0.01, 0.05))
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+ggsave("results/0_loop_distance_cutoff.pdf")
+```
+
+
+```{r}
+# List the bigwig files of the different marks
+mark_files <- file.path(data_dir, "marks_bw/*/MBT*") %>% 
+  Sys.glob()
+mark_files <- file.path(data_dir, "marks_bw", c("H3K4me3", "TBP"),"*_MBT*") %>% 
+  Sys.glob() %>% 
+  c(mark_files)
+mark_names <- str_extract(mark_files, "marks_bw/(.+)/", group = 1)
+
+# List the ATAC files
+atac_files <- file.path(data_dir, "marks_bw/ATAC/NC14*") %>% 
+  Sys.glob() %>% 
+  str_subset("all", negate = TRUE)
+atac_names <- str_extract(atac_files, "marks_bw/.+(mono|open).bw", group = 1) %>% 
+  paste("ATAC", ., sep = "_")
+
+# List the insulator files
+ins_files <- file.path(data_dir, "marks_bw/insulators_furlong/*") %>% 
+  Sys.glob()
+ins_names <- str_extract(ins_files, "insulators_furlong/([^_]+)_", group = 1)
+
+# Load the signal of all marks in the boundary regions as matrices
+mark_matrices <- lapply(
+  c(mark_files, atac_files, ins_files),
+  function(file) {
+    import.bw(
+      file,
+      selection = BigWigSelection(anchors_ext),
+      as = "NumericList"
+    ) %>% 
+      as.matrix()
+  }
+) %>% 
+  magrittr::set_names(c(mark_names, atac_names, ins_names))
+
+# Define the regions of center and outside for each mark to calculate the enrichment
+regions <- data.frame(
+  mark = rep(
+    c(
+      "CLAMP",
+      "H3K27me3",
+      "H3K36me3",
+      "PolII",
+      "RNA",
+      "Zld",
+      "ATAC_mono",
+      "ATAC_open",
+      "BEAF",
+      "CP190",
+      "CTCF",
+      "SUHW",
+      "TBP",
+      "H3K4me3",
+      "H4K16ac",
+      "GAF"
+    ),
+    each = 2
+  ),
+  region = c("center", "outside"),
+  start = c(rep(c(-500, -2250), 14), -400, -1100, -500, -2250),
+  end = c(rep(c(500, -1000), 14), 400, -400, 500, -1000)
+)
+```
+
+
+```{r}
+# Calculate the average profile of each signal around all boundaries
+mark_average <- lapply(
+  mark_matrices,
+  function(matrix) {
+    data.frame(
+      pos = (1:ncol(matrix)) - region_width / 2,
+      mean = colMeans(matrix),
+      sd = apply(matrix, 2, sd)
+    )
+  }
+) %>% 
+  bind_rows(.id = "mark") %>% 
+  group_by(mark) %>% 
+  mutate(
+    norm = (mean - min(mean)) / (max(mean) - min(mean))
+  )
+
+# Plot the profile of all marks around the boundaries and highlight the center (red) and outside (blue) regions
+region_plot <- ggplot(mark_average) +
+  # geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd), alpha = 0.2) +
+  geom_rect(
+    data = regions %>% filter(region == "center"),
+    aes(xmin = start, xmax = end),
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.1,
+    fill = "red"
+  ) +
+  geom_rect(
+    data = regions %>% filter(region == "outside"),
+    aes(xmin = start, xmax = end),
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.1,
+    fill = "blue"
+  ) +
+  geom_rect(
+    data = regions %>% filter(region == "outside"),
+    aes(xmin = -start, xmax = -end),
+    ymin = -Inf, ymax = Inf,
+    alpha = 0.1,
+    fill = "blue"
+  ) +
+  geom_line(aes(x = pos, y = mean, colour = mark)) +
+  scale_x_continuous(
+    labels = scales::label_number(scale_cut = scales::cut_si("b"))
+  ) +
+  facet_wrap(~ mark, scales = "free_y") +
+  guides(
+    colour = "none"
+  ) +
+  labs(
+    x = "Position rel. to boundary center",
+    y = "Average signal",
+    colour = "Mark"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+region_plot
+ggsave("results/1_average_regions_of_enrichment.pdf", region_plot, width = 9, height = 5)
+```
+
+
+```{r}
+# Calculate the signal enrichment of marks of the center (red) compared to the outside (blue) regions
+marks_enrich <- lapply(
+  names(mark_matrices),
+  function(name) {
+    # Get the signal matrix for the mark
+    mat <- mark_matrices[[name]]
+    
+    # Get the minimum and maximum values for each region
+    mins <- apply(mat, 1, min)
+    maxs <- apply(mat, 1, max)
+    
+    # Get the coordinates for the center and outside regions, as defined above
+    center <- regions %>% filter(mark == name, region == "center")
+    outside <- regions %>% filter(mark == name, region == "outside")
+    
+    # Get the average signal of center and outside regions
+    data.frame(
+      anchor = 1:nrow(mat),
+      center = (rowMeans(mat[, (half_width + center$start):(half_width + center$end)]) - mins) / (maxs - mins),
+      outside = (rowMeans(mat[, c((half_width + outside$start):(half_width + outside$end), (half_width - outside$start):(half_width - outside$end))]) - mins) / (maxs - mins)
+    )
+  }
+) %>% 
+  magrittr::set_names(names(mark_matrices)) %>% 
+  bind_rows(.id = "mark") %>% 
+  mutate(
+    enrichment = center / outside,
+    logenrich = log2(enrichment)
+  )
+```
+
+
+```{r}
+# Pivot the enrichment data into wide format, with 1 column for each mark
+wide_enrich <- marks_enrich %>% 
+  drop_na() %>% 
+  select(anchor, mark, logenrich) %>% 
+  pivot_wider(names_from = mark, values_from = logenrich) %>% 
+  drop_na() %>% 
+  filter(if_all(-anchor, is.finite))
+
+# Perform UMAP transformation on the signal data
+umap_base <- umap2(wide_enrich %>% select(-anchor)) %>% 
+  as.data.frame()
+```
+
+
+```{r}
+# Calculate the distance between all boundaries and cluster using hierarchical clustering
+distances <- dist(wide_enrich %>% select(-anchor), method = "euclidean")
+hclust_avg <- hclust(distances, method = 'ward.D2')
+
+# Minimum cluster size is 1% of boundaries
+min_cluster_size <- floor(nrow(wide_enrich) / 100)
+```
+
+
+```{r}
+if (optimise_clusters) {
+  n_clusters <- 2:15
+  offset <- min(n_clusters) - 1
+  base_dir <- "optimise_clustering/NC14_ward_filtered"
+  
+  
+  iter_clusters <- lapply(
+    n_clusters,
+    function(n) {
+      cutree(hclust_avg, k = n)
+    }
+  )
+  
+  for (idx in 1:length(iter_clusters)) {
+    clusters <- iter_clusters[[idx]]
+    
+    # Create a list of boundary IDs for each cluster
+    anchors_per_cluster <- wide_enrich %>% 
+      mutate(cluster = clusters) %>% 
+      select(anchor, cluster) %>% 
+      group_by(cluster) %>% 
+      summarise(
+        b = list(anchor)
+      ) %>% 
+      tibble::deframe()
+    
+    # Get the size of each cluster
+    sizes <- data.frame(
+      cluster = as.factor(1:(idx + offset)),
+      size = sapply(anchors_per_cluster, length)
+    )
+    
+    iter_umapped <- umap_base %>%
+      mutate(
+        cluster = clusters %>% as.factor(),
+        cluster = forcats::fct_lump_min(cluster, min_cluster_size, other_level = NA)
+      )
+  
+    ggplot(iter_umapped) +
+      geom_point(aes(x = V1, y = V2, colour = cluster)) +
+      labs(
+        x = "UMAP 1",
+        y = "UMAP 2",
+        colour = "Cluster"
+      ) +
+      theme_bw() +
+      theme(
+        aspect.ratio = 1,
+        panel.grid = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank()
+      )
+  
+    ggsave(
+      file.path(base_dir, paste0("umap_of_", idx + offset, "_clusters.pdf"))
+    )
+    
+    # Get the average profiles for each mark in the top 3 clusters
+    signal_per_cluster <- lapply(
+      c(mark_names, atac_names, ins_names),
+      function(target) {
+        lapply(
+          anchors_per_cluster[sizes$size >= min_cluster_size],
+          function(bounds) {
+            mat <- mark_matrices[[target]][bounds, ]
+            
+            data.frame(
+              mark = target,
+              pos = (1:ncol(mat)) - 2500,
+              mean = colMeans(mat),
+              sd = apply(mat, 2, sd)
+            )
+          }
+        ) %>% 
+        bind_rows(.id = "cluster")
+      }
+    ) %>% 
+      magrittr::set_names(c(mark_names, atac_names, ins_names)) %>% 
+      bind_rows(.id = "mark") %>% 
+      group_by(mark) %>% 
+      mutate(
+        norm = (mean - min(mean)) / (max(mean) - min(mean))
+      )
+  
+    label_size <- sizes %>% 
+      tibble::deframe() %>% 
+      paste0("Cluster ", names(.), "\n(n = ", ., ")") %>% 
+      magrittr::set_names(sizes$cluster) %>% 
+      as_labeller()
+  
+  
+    # Plot the average profile of each mark in each cluster
+    profile_plot <- ggplot(signal_per_cluster, aes(x = pos)) +
+      geom_line(aes(y = norm, group = mark, colour = cluster)) +
+      facet_grid(mark ~ cluster, scales = "free_y", labeller = labeller(cluster = label_size)) +
+      scale_x_continuous(
+        breaks = c(-2000, 0, 2000),
+        labels = scales::label_number(scale_cut = scales::cut_si(unit = "b")),
+        expand = expansion(0)
+      ) +
+      scale_y_continuous(
+        breaks = c(0, 0.5, 1),
+        labels = c(0, "", 1)
+      ) +
+      # scale_colour_manual(
+      #   values = cluster_colours
+      # ) +
+      guides(
+        colour = "none"
+      ) +
+      labs(
+        x = "Dist. to anchor center",
+        y = "Normalized signal"
+      ) +
+      theme_bw() +
+      theme(
+        panel.grid.minor = element_blank(),
+        strip.text.y = element_text(angle = 0),
+        strip.background = element_blank()
+      )
+    
+    ggsave(
+      file.path(base_dir, paste0("signal_of_", idx + offset, "_clusters.pdf"))
+    )
+  }
+  
+  
+  number_of_clusters <- sapply(
+    iter_clusters,
+    function(x) {
+      sum(table(x) > min_cluster_size)
+    }
+  ) %>% 
+    magrittr::set_names(n_clusters) %>% 
+    data.frame(
+      total_clusters = names(.),
+      final_clusters = .
+    )
+  readr::write_tsv(number_of_clusters, file.path(base_dir, "number_of_clusters.tsv"))
+}
+```
+
+
+```{r}
+cluster_reordering <- c(
+  "5" = "1",
+  "2" = "2",
+  "4" = "3",
+  "6" = "4",
+  "7" = "5",
+  "3" = "6",
+  "1" = "7"
+)
+
+# Assign each boundary to a cluster
+clusters <- cluster_reordering[cutree(hclust_avg, k = 7) %>% as.character()] %>% unname()
+
+
+# Create a list of boundariy IDs for each cluster
+anchors_per_cluster <- wide_enrich %>% 
+  mutate(cluster = clusters) %>% 
+  select(anchor, cluster) %>% 
+  group_by(cluster) %>% 
+  summarise(
+    b = list(anchor)
+  ) %>% 
+  tibble::deframe()
+
+# Perform PCA analysis for all boundaries
+pca <- prcomp(wide_enrich %>% select(-anchor) %>% t(), scale. = TRUE, center = TRUE) %>% 
+  summary()
+
+# Plot the PCA results, colouring each dot by its cluster
+df <- as.data.frame(pca$rotation) %>% 
+  mutate(
+    cluster = clusters %>% as.factor(),
+    cluster = forcats::fct_lump_min(cluster, min_cluster_size, other_level = NA)
+  )
+pca_plot <- ggplot(df) +
+  geom_point(aes(x = PC1, y = PC2, colour = cluster)) +
+  scale_colour_manual(
+    values = cluster_colours12,
+    na.value = "#e2e2e2"
+  ) +
+  labs(
+    x = paste0("PC1: ", round(pca$importance[2, 1] * 100, 1), "%"),
+    y = paste0("PC2: ", round(pca$importance[2, 2] * 100, 1), "%"),
+    colour = "Cluster"
+  ) +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    panel.grid.minor = element_blank()
+  )
+pca_plot
+ggsave("results/2_pca_plot_of_clusters.pdf", pca_plot)
+```
+
+
+```{r}
+umapped <- umap_base %>% 
+  mutate(
+    cluster = clusters %>% as.factor(),
+    cluster = forcats::fct_lump_min(cluster, min_cluster_size, other_level = NA)
+  )
+
+umap_plot <- ggplot(umapped) +
+  geom_point(aes(x = -V1, y = V2, colour = cluster)) +
+  scale_colour_manual(
+    values = cluster_colours12,
+    na.value = "#e2e2e2"
+  ) +
+  labs(
+    x = "UMAP 1",
+    y = "UMAP 2",
+    colour = "Cluster"
+  ) +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    panel.grid = element_blank()
+  )
+umap_plot
+ggsave("results/3_umap_plot_of_clusters.pdf", umap_plot)
+```
+
+
+```{r}
+# Get the size of each cluster
+sizes <- data.frame(
+  cluster = as.factor(1:length(anchors_per_cluster)),
+  size = sapply(anchors_per_cluster, length)
+)
+
+# Plot the size of each cluster
+size_plot <- ggplot(sizes) +
+  geom_col(aes(x = cluster, y = size, fill = cluster)) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  scale_fill_manual(
+    values = cluster_colours12,
+    na.value = "#e2e2e2"
+  ) +
+  labs(
+    x = "Cluster",
+    y = "Number of anchors",
+    fill = "Cluster"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+size_plot
+ggsave("results/4_size_of_clusters.pdf", size_plot)
+
+# How many boundaries are in clusters with minimum size
+sizes %>% 
+  group_by(size >= min_cluster_size) %>% 
+  summarise(
+    total = sum(size)
+  )
+```
+
+
+```{r}
+# Set the order in which the marks are arranged
+mark_levels <- c(
+  "ATAC_mono",
+  "ATAC_open", 
+  "BEAF",
+  "CTCF",
+  "CP190",
+  "SUHW",
+  "CLAMP",
+  "GAF",
+  "Zld",
+  "TBP",
+  "PolII",
+  "RNA",
+  "H3K4me3",
+  "H3K36me3",
+  "H4K16ac",
+  "H3K27me3"
+)
+
+# Get the average profiles for each mark in the top 3 clusters
+signal_per_cluster <- lapply(
+  c(mark_names, atac_names, ins_names),
+  function(target) {
+    lapply(
+      anchors_per_cluster[sapply(anchors_per_cluster, length) >= min_cluster_size],
+      function(bounds) {
+        mat <- mark_matrices[[target]][bounds, ]
+        
+        data.frame(
+          mark = target,
+          pos = (1:ncol(mat)) - 2500,
+          mean = colMeans(mat),
+          sd = apply(mat, 2, sd)
+        )
+      }
+    ) %>% 
+    bind_rows(.id = "cluster")
+  }
+) %>% 
+  magrittr::set_names(c(mark_names, atac_names, ins_names)) %>% 
+  bind_rows(.id = "mark") %>% 
+  group_by(mark) %>% 
+  mutate(
+    norm = (mean - min(mean)) / (max(mean) - min(mean)),
+    cluster = factor(cluster) %>% forcats::fct_inseq(),
+    mark = factor(mark, levels = mark_levels)
+  )
+
+label_size <- sizes %>% 
+  tibble::deframe() %>% 
+  paste0("Cluster ", names(.), "\n(n = ", ., ")") %>% 
+  magrittr::set_names(sizes$cluster) %>% 
+  as_labeller()
+
+
+# Plot the average profile of each mark in each cluster
+profile_plot <- ggplot(signal_per_cluster, aes(x = pos)) +
+  rasterize(geom_line(aes(y = norm, group = mark, colour = cluster)), dpi = 300) +
+  # facet_wrap(~ quantile, nrow = 2) +
+  facet_grid(mark ~ cluster, scales = "free_y", labeller = labeller(cluster = label_size)) +
+  scale_x_continuous(
+    breaks = c(-2000, 0, 2000),
+    labels = scales::label_number(scale_cut = scales::cut_si(unit = "b")),
+    expand = expansion(0)
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 0.5, 1),
+    labels = c(0, "", 1)
+  ) +
+  scale_colour_manual(
+    values = cluster_colours12
+  ) +
+  guides(
+    colour = "none"
+  ) +
+  labs(
+    x = "Dist. to anchor center",
+    y = "Normalized signal"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text.y = element_text(angle = 0),
+    strip.background = element_blank()
+  )
+profile_plot
+ggsave("results/5_average_profile_per_cluster.pdf", profile_plot, width = 7*1.2, height = 6*1.2)
+```
+
+
+```{r}
+# Add the cluster to the merged anchors
+anchors_merged$cluster <- 0
+for (cluster in names(anchors_per_cluster)) {
+  anchors_merged[anchors_per_cluster[[cluster]]]$cluster <- cluster
+}
+
+# Get the cluster for the original anchors by overlapping with the merged ones
+hits <- findOverlaps(anchors, anchors_merged)
+
+# Prepare a dataframe of the loop and anchor IDs with their corresponding cluster
+loop_id_cluster <- data.frame(
+  loop_id = anchors[queryHits(hits)]$loop_id,
+  anchor_id = anchors[queryHits(hits)]$anchor_id,
+  cluster = anchors_merged[subjectHits(hits)]$cluster
+)
+
+# Join the cluster and anchor info to the dataframe of loops
+# This allows to get the size of loops for each cluster
+distances_by_cluster <- left_join(anchors_df, loop_id_cluster, by = "loop_id") %>% 
+  filter(cluster != "0") %>% 
+  mutate(
+    cluster = as.factor(cluster) %>% forcats::fct_inseq(),
+    size = ifelse(distance >= 40000, "medium", "short")
+  )
+
+
+# Plot the distribution of loop sizes across all clusters
+distance_plot <- ggplot(distances_by_cluster, aes(x = cluster, y = distance)) +
+  geom_violin(aes(fill = cluster), scale = "width") +
+  geom_boxplot(width = 0.3) +
+  scale_y_continuous(
+    trans = "log10",
+    labels = scales::label_number(scale_cut = append(scales::cut_short_scale(), 1, 1), suffix = "b")
+  ) +
+  scale_fill_manual(values = cluster_colours12) +
+  guides(
+    fill = "none"
+  ) +
+  labs(
+    x = "Cluster",
+    y = "Loop distance"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+distance_plot
+ggsave("results/6_loop_size_per_cluster.pdf", distance_plot, width = 7, height = 4)
+```
+
+
+```{r}
+# For each loop, check if the 2 anchors are within the same cluster
+# Then, count the absolute and relative number of loops with same-cluster anchors within each cluster
+cluster_counts <- distances_by_cluster %>% 
+  group_by(loop_id) %>% 
+  filter(length(cluster) == 2) %>% 
+  summarise(
+    same_cluster = cluster[[1]] == cluster[[2]],
+    cluster = list(cluster) %>% lapply(sort)
+  ) %>% 
+  filter(same_cluster) %>% 
+  mutate(
+    cluster = sapply(cluster, unique)
+  ) %>% 
+  group_by(cluster) %>% 
+  count() %>% 
+  left_join(sizes) %>% 
+  ungroup() %>% 
+  mutate(
+    ratio = n / size,
+    cluster = forcats::fct_reorder(cluster,desc(ratio))
+  )
+
+# Randomize the cluster for each loop_id and count again
+random_cluster_counts <- distances_by_cluster %>% 
+  mutate(
+    cluster = sample(cluster)
+  ) %>% 
+  group_by(loop_id) %>% 
+  filter(length(cluster) == 2) %>%
+  summarise(
+    same_cluster = cluster[[1]] == cluster[[2]],
+    cluster = list(cluster) %>% lapply(sort)
+  ) %>% 
+  filter(same_cluster) %>% 
+  mutate(
+    cluster = sapply(cluster, unique)
+  ) %>% 
+  group_by(cluster) %>% 
+  count() %>% 
+  left_join(sizes) %>% 
+  ungroup() %>% 
+  mutate(
+    ratio = n / size,
+    cluster = forcats::fct_reorder(cluster, desc(n))
+  )
+
+cluster_counts$cluster %>% as.integer() %>% sort()
+
+
+# Plot the ratio of loops with anchors of the same cluster per each cluster
+same_cluster_plot <- ggplot(cluster_counts) +
+  geom_col(aes(x = cluster, y = ratio, fill = cluster)) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0.01, 0.05)),
+    labels = scales::label_percent()
+  ) +
+  scale_fill_manual(
+    breaks = cluster_counts$cluster %>% as.integer() %>% sort(),
+    values = cluster_colours12,
+    na.value = "#e2e2e2"
+  ) +
+  labs(
+    x = "Cluster",
+    y = "Number of loops with anchors of same cluster",
+    fill = "Cluster"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank()
+  )
+same_cluster_plot
+ggsave("results/7_loops_with_same_anchors.pdf", same_cluster_plot, width = 7, height = 4)
+```
+
+
+```{r}
+# Add the clusters of each anchor to the original bed
+bedpe_with_clusters <- left_join(anchors_df, loop_id_cluster) %>% 
+  mutate(
+    anchor = ifelse(anchor_id <= 2213, "1", "2"),
+    cluster = replace(cluster, cluster == "0", ".")
+  ) %>% 
+  pivot_wider(id_cols = -anchor_id, names_from = "anchor", names_prefix = "cluster_", values_from = "cluster") %>% 
+  select(-loop_id, -midpoint1, -midpoint2, -distance)
+write_tsv(bedpe_with_clusters, "loops/NC14_250_1kb_2kb_4kb_16kb.clean.bedpe", col_names = FALSE)
+```
+
+
+```{r}
+enrich_cutoff <- 1
+
+# Get the GAF and Zld enrichment values for all boundaries in the Zld-specific (3) and GAF + Zld (4) clusters
+slim_enrich <- wide_enrich %>% 
+  # select(-BEAF, -CTCF, -CP190, -SUHW) %>%
+  select(anchor, GAF, Zld) %>%
+  # filter(GAF >= enrich_cutoff | Zld >= enrich_cutoff)
+  filter(anchor %in% c(anchors_per_cluster[["1"]]))
+
+# Perform UMAP transformation on the signal data
+slim_umap_base <- umap2(slim_enrich %>% select(-anchor)) %>% 
+  as.data.frame()
+
+
+# Perform hierarchical clustering based on GAF and Zld enrichment
+slim_distances <- dist(slim_enrich %>% select(-anchor), method = "euclidean")
+slim_hclust_avg <- hclust(slim_distances, method = 'ward.D2')
+```
+
+
+```{r}
+slim_clusters <- cutree(slim_hclust_avg, k = 3)
+
+
+slim_umapped <- slim_umap_base %>% 
+  mutate(
+    cluster = slim_clusters %>% as.factor(),
+    cluster = forcats::fct_lump_min(cluster, min_cluster_size, other_level = NA)
+  )
+
+ggplot(slim_umapped) +
+  geom_point(aes(x = V1, y = V2, colour = cluster)) +
+  scale_colour_manual(
+    values = cluster_colours12,
+    na.value = "#e2e2e2"
+  ) +
+  labs(
+    x = "UMAP 1",
+    y = "UMAP 2",
+    colour = "Cluster"
+  ) +
+  theme_bw() +
+  theme(
+    aspect.ratio = 1,
+    panel.grid = element_blank(),
+    axis.ticks = element_blank(),
+    axis.text = element_blank()
+  )
+
+
+
+# Create a list of boundary IDs for each cluster
+slim_boundaries <- slim_enrich %>% 
+  mutate(cluster = slim_clusters) %>% 
+  select(anchor, cluster) %>% 
+  group_by(cluster) %>% 
+  summarise(
+    b = list(anchor)
+  ) %>% 
+  tibble::deframe()
+
+
+# Plot the PCA results, colouring each dot by its cluster
+slim_df <- slim_enrich %>%
+  mutate(
+    cluster = slim_clusters %>% as.factor() %>% forcats::fct_lump_min(10, other_level = NA),
+    quadrant = as.factor((GAF > 0.4) + (Zld > 0.4))
+  )
+
+ggplot(slim_df) +
+  geom_hline(yintercept = enrich_cutoff / max(slim_df$GAF), linetype = 2, colour = "grey30") +
+  geom_vline(xintercept = enrich_cutoff / max(slim_df$Zld), linetype = 2, colour = "grey30") +
+  geom_point(aes(x = Zld / max(Zld), y = GAF / max(GAF), colour = cluster)) +
+  scale_colour_manual(
+    values = cluster_colours12,
+    na.value = "#e2e2e2"
+  ) +
+  labs(
+    # x = paste0("PC1: ", round(pca$importance[2, 1] * 100, 1), "%"),
+    # y = paste0("PC2: ", round(pca$importance[2, 2] * 100, 1), "%"),
+    colour = "Cluster"
+  ) +
+  coord_fixed() +
+  theme_bw() +
+  theme(
+    # aspect.ratio = 1,
+    panel.grid.minor = element_blank()
+  )
+
+
+slim_signals <- lapply(
+  c(mark_names, atac_names, ins_names),
+  function(target) {
+    lapply(
+      slim_boundaries[sapply(slim_boundaries, length) >= 2],
+      function(bounds) {
+        mat <- mark_matrices[[target]][bounds, ]
+        
+        data.frame(
+          mark = target,
+          pos = (1:ncol(mat)) - 2500,
+          mean = colMeans(mat),
+          sd = apply(mat, 2, sd)
+        )
+      }
+    ) %>% 
+    bind_rows(.id = "cluster")
+  }
+) %>% 
+  magrittr::set_names(c(mark_names, atac_names, ins_names)) %>% 
+  bind_rows(.id = "mark") %>% 
+  group_by(mark) %>% 
+  mutate(
+    norm = (mean - min(mean)) / (max(mean) - min(mean)),
+    mark = factor(mark, levels = mark_levels)
+  ) %>% 
+  ungroup() %>% 
+  filter(!mark %in% c("BEAF", "CTCF", "CP190", "SUHW"))
+
+slim_label <- sapply(
+    slim_boundaries,
+    length
+  ) %>% 
+  # tibble::deframe() %>% 
+  paste0("Cluster ", names(.), "\n(n = ", ., ")") %>% 
+  magrittr::set_names(1:length(slim_boundaries)) %>% 
+  as_labeller()
+
+
+# Plot the average profile of each mark in each cluster
+slim_signal_plot <- ggplot(slim_signals, aes(x = pos)) +
+  rasterize(geom_line(aes(y = norm, group = mark, colour = cluster)), dpi = 300) +
+  facet_grid(mark ~ cluster, scales = "free_y", labeller = labeller(cluster = slim_label)) +
+  scale_x_continuous(
+    breaks = c(-2000, 0, 2000),
+    labels = scales::label_number(scale_cut = scales::cut_si(unit = "b")),
+    expand = expansion(0)
+  ) +
+  scale_y_continuous(
+    breaks = c(0, 0.5, 1),
+    labels = c(0, "", 1)
+  ) +
+  scale_colour_manual(
+    values = c("#5ca793", "#117899", "#0d3c55")
+  ) +
+  guides(
+    colour = "none"
+  ) +
+  labs(
+    x = "Dist. to anchor center",
+    y = "Normalized signal"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text.y = element_text(angle = 0),
+    strip.background = element_blank()
+  )
+slim_signal_plot
+ggsave("results/8_Zld_GAF_subclustering.pdf", slim_signal_plot, width = 3.5*1.2, height = 6*1.2)
+```
+
+
+```{r}
+slim_anchors <- anchors_merged[slim_enrich$anchor]
+slim_anchors$score <- slim_clusters
+export.bed(slim_anchors, "anchors/zld_gaf_subclustered_anchors.bed")
+```
