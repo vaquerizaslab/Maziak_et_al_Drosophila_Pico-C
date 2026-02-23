@@ -1,7 +1,7 @@
-# 3D Genome Reorganization Foreshadows Zygotic Genome Activation in *Drosophila*
+# Three-dimensional genome reorganization foreshadows zygotic genome activation in *Drosophila*
 
 This repository contains the computational analyses associated with the study  
-**“3D Genome Reorganization Foreshadows Zygotic Genome Activation in *Drosophila***”.
+**“Three-dimensional genome reorganization foreshadows zygotic genome activation in *Drosophila***”.
 
 The code provided here complements the computational methods described in the manuscript. Please note that while we aim for easy reproducibility, this repository contains the original code that was developed over time and used for the analyses, and may not represent a fully self-contained workflow for reproducing all results in the paper.
 
@@ -18,6 +18,7 @@ The repository contains the four main computational workflows described in the p
    - Generation and normalization of contact maps for downstream analysis.
    - Boundary detection, loop calling, and compartment identification from Pico-C data. Source data and outputs of this analysis are additionally available in the *Supplementary Data* accompanying the manuscript.
    - Chromosight analysis to quanitfy loop and boundary strength across in controls and abrogatted transcription elongation maps, and mutant maps. 
+   - Metaloci script and snakmake.
    - This will cover a bulk of the paper's data.
    > Note: knockdown Pico-C's and α-Amanitin and their respective controls were processed in the same manner. 
 
