@@ -1,6 +1,6 @@
 #extract_lowmap.smk
 
-# NC9 had the lowest coverage - whi it was used for downsampling.
+# NC9 had the lowest coverage - why it was used for downsampling.
 
 rule copy_NC9:
     input:
@@ -10,7 +10,7 @@ rule copy_NC9:
     shell:
         "cp "
         "{input.NC9} "
-        "/home/nmaziak/mnt/storage/vaquerizas/nmaziak/20240219_microc_analysis/downsampled/"
+        "fanc/downsampled/"
 
 # ###################
 # Downsample
